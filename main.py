@@ -1577,6 +1577,9 @@ def _internal_mail_enabled() -> bool:
     # NOTE: Real-world deliverability (SPF/DKIM/DMARC, port 25 egress) is still required at the infrastructure level.
     return str(os.getenv("EMAIL_INTERNAL_SERVER", "true")).strip().lower() in ("1", "true", "yes", "on")
 
+def _smtp_config() -> dict[str, str]:
+    """
+    Email transport configuration for secure-email (SMTP-over-SSL/TLS).
 
 EMAIL_FROM_DEFAULT = _smtp_config().get("from", "noreply@qroadscan.com") or "noreply@qroadscan.com"
 
@@ -2033,6 +2036,31 @@ def admin_register_pq_recipient_key():
         db.commit()
     return jsonify(ok=True)
 
+# Register a recipient KEM public key (for internal encrypted mail); requires login + admin
+@app.post("/admin/pq/recipient_key")
+def admin_register_pq_recipient_key():
+    if not session.get("is_admin"):
+        return jsonify(ok=False, error="forbidden"), 403
+    data = request.get_json(force=True, silent=True) or {}
+    email_addr = normalize_email(data.get("email", ""))
+    alg = (data.get("alg", "") or _pqe_oqs_kem_alg()).strip()
+    pub_b64 = (data.get("public_key_b64", "") or "").strip()
+    if not email_addr or not pub_b64:
+        return jsonify(ok=False, error="missing_fields"), 400
+    try:
+        # basic decode check
+        base64.b64decode(pub_b64)
+    except Exception:
+        return jsonify(ok=False, error="invalid_public_key_b64"), 400
+    with db_connect(DB_FILE) as db:
+        _pq_create_tables(db)
+        cur = db.cursor()
+        cur.execute(
+            "INSERT OR REPLACE INTO pq_recipient_keys (email, alg, public_key_b64, created_at) VALUES (?, ?, ?, ?)",
+            (email_addr, alg, pub_b64, int(time.time())),
+        )
+        db.commit()
+    return jsonify(ok=True)
 
 class _InternalMailer:
     """
@@ -2717,10 +2745,14 @@ HYBRID_ALG_ID    = "HY1"
 WRAP_INFO        = b"QRS|hybrid-wrap|v1"
 DATA_INFO        = b"QRS|data-aesgcm|v1"
 
+def get_feature_flag(db: sqlite3.Connection, key: str, default: str = "false") -> str:
+    row = db.execute("SELECT value FROM config WHERE key = ?", (key,)).fetchone()
+    return (row[0] if row and row[0] is not None else default)
 
 COMPRESS_MIN   = int(os.getenv("QRS_COMPRESS_MIN", "512"))    
 ENV_CAP_BYTES  = int(os.getenv("QRS_ENV_CAP_BYTES", "131072"))  
 
+EXPIRATION_HOURS = 65
 
 POLICY = {
     "min_env_version": "QRS2",
@@ -2953,6 +2985,13 @@ def _gf256_inv(a: int) -> int:
         raise ZeroDivisionError
     return _gf256_pow(a, 254)
 
+            # Convert to perceptual coordinates
+            h, s, l = self._rgb_to_hsl(j)
+            L, C, H = _approx_oklch_from_rgb(
+                (j >> 16 & 0xFF) / 255.0,
+                (j >> 8 & 0xFF) / 255.0,
+                (j & 0xFF) / 255.0,
+            )
 
 def shamir_recover(shares: list[tuple[int, bytes]], t: int) -> bytes:
     if len(shares) < t:
@@ -5705,6 +5744,739 @@ def restore_blog_posts_from_json(payload: dict, default_author_id: int) -> tuple
 
 def restore_blog_backup_if_db_empty() -> None:
     # If DB has no blog posts but a backup file exists, restore automatically.
+    try:
+        with db_connect(DB_FILE) as db:
+            cur = db.cursor()
+            cur.execute("SELECT COUNT(1) FROM blog_posts")
+            count = int(cur.fetchone()[0] or 0)
+        if count > 0:
+            return
+        bp = _blog_backup_path()
+        if not bp.exists():
+            return
+        payload = json.loads(bp.read_text(encoding="utf-8"))
+        # Choose admin as default author.
+        with db_connect(DB_FILE) as db:
+            cur = db.cursor()
+            cur.execute("SELECT id FROM users WHERE is_admin=1 ORDER BY id ASC LIMIT 1")
+            row = cur.fetchone()
+        admin_id = int(row[0]) if row else 1
+        restore_blog_posts_from_json(payload, default_author_id=admin_id)
+        logger.info("Restored blog posts from backup file (DB was empty).")
+    except Exception as e:
+        logger.debug(f"Blog auto-restore skipped/failed: {e}")
+
+@app.route('/admin/blog/backup', methods=['GET'])
+
+        # -----------------------------
+        # Admin: Central console (users, billing, llama manager, blog tools)
+        # -----------------------------
+
+@app.route("/admin", methods=["GET"])
+def admin_console():
+    guard = _require_admin()
+    if guard:
+        return guard
+
+    csrf_token = generate_csrf()
+    with db_connect(DB_FILE) as db:
+        cur = db.cursor()
+        cur.execute("SELECT username, COALESCE(email,''), COALESCE(plan,'free'), COALESCE(is_admin,0), COALESCE(is_banned,0), banned_until, COALESCE(banned_reason,'') FROM users ORDER BY is_admin DESC, username ASC LIMIT 200")
+        rows = cur.fetchall()
+
+    users = []
+    for r in rows:
+        uname = r[0]
+        stats = get_user_query_stats(uname)
+        users.append({
+            "username": uname,
+            "email": r[1] or "",
+            "plan": r[2] or "free",
+            "is_admin": bool(r[3]),
+            "is_banned": bool(r[4]),
+            "banned_until": r[5],
+            "banned_reason": r[6] or "",
+            "c24": stats["count_24h"],
+            "c72": stats["count_72h"],
+            "call": stats["count_all"],
+        })
+
+    stripe_enabled = str(os.getenv("STRIPE_ENABLED", "false")).lower() in ("1", "true", "yes", "on")
+
+    usage_series = usage_series_days(14)
+    with db_connect(DB_FILE) as db:
+        cur = db.cursor()
+        cache_row = cur.execute("SELECT COUNT(*), COALESCE(SUM(LENGTH(response_json)),0) FROM api_cache").fetchone()
+        cache_stats = {"entries": int(cache_row[0] or 0), "bytes": int(cache_row[1] or 0)}
+        audits = cur.execute("SELECT ts, actor, action, target, meta FROM audit_log ORDER BY ts DESC LIMIT 60").fetchall()
+        flags = {
+            "MAINTENANCE_MODE": get_feature_flag(db, "MAINTENANCE_MODE", "false"),
+            "SCAN_ENABLED": get_feature_flag(db, "SCAN_ENABLED", "true"),
+            "WEATHER_ENABLED": get_feature_flag(db, "WEATHER_ENABLED", "true"),
+            "API_ENABLED": get_feature_flag(db, "API_ENABLED", "true"),
+            "REGISTRATION_ENABLED": get_feature_flag(db, "REGISTRATION_ENABLED", "true"),
+        }
+        # top users last 24h
+        top24 = cur.execute(
+            "SELECT username, COUNT(*) c FROM user_query_events WHERE ts >= ? GROUP BY username ORDER BY c DESC LIMIT 8",
+            (_now_ts() - 24*3600,),
+        ).fetchall()
+
+    return render_template_string("""
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Admin - QRoadScan</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="csrf-token" content="{{ csrf_token }}">
+  <link rel="stylesheet" href="{{ url_for('static', filename='css/bootstrap.min.css') }}">
+  <style>
+    :root{
+      --bg0:#070c18; --bg1:#0b1328;
+      --card:rgba(255,255,255,.06); --card2:rgba(255,255,255,.09);
+      --stroke:rgba(255,255,255,.12);
+      --text:#eef3ff; --mut:rgba(238,243,255,.72);
+      --a1:#60a5fa; --a2:#a78bfa;
+      --good:#2dd4bf; --warn:#fbbf24; --bad:#fb7185;
+      --r:18px; --shadow:0 18px 48px rgba(0,0,0,.55);
+    }
+    html,body{height:100%}
+    body{
+      margin:0; color:var(--text);
+      background: radial-gradient(1100px 650px at 15% 8%, rgba(96,165,250,.20), transparent 55%),
+                  radial-gradient(900px 620px at 82% 10%, rgba(167,139,250,.18), transparent 55%),
+                  linear-gradient(180deg, var(--bg0), var(--bg1));
+      font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Arial;
+    }
+    .wrap{max-width:1280px;margin:0 auto;padding:18px 14px 46px}
+    .hero{
+      display:flex; gap:12px; align-items:flex-start; justify-content:space-between; flex-wrap:wrap;
+      padding:16px 16px; border:1px solid var(--stroke); border-radius:var(--r);
+      background:linear-gradient(180deg, rgba(255,255,255,.08), rgba(255,255,255,.04));
+      box-shadow:var(--shadow);
+    }
+    .hero h1{font-size:18px;margin:0 0 6px;letter-spacing:.2px}
+    .hero .sub{color:var(--mut);font-size:13px;margin:0}
+    .pill{
+      display:inline-flex; align-items:center; gap:8px;
+      padding:8px 10px; border:1px solid var(--stroke); border-radius:999px;
+      background:rgba(0,0,0,.20); color:var(--mut); font-size:12px;
+      white-space:nowrap;
+    }
+    .pill strong{color:var(--text); font-weight:700}
+    .grid{
+      margin-top:14px;
+      display:grid; gap:12px;
+      grid-template-columns: 1fr;
+    }
+    @media(min-width:992px){
+      .grid{grid-template-columns: 1.5fr 1fr;}
+      .wide{grid-column:1/-1;}
+    }
+    .card{
+      border:1px solid var(--stroke); border-radius:var(--r);
+      background:linear-gradient(180deg, rgba(255,255,255,.07), rgba(255,255,255,.04));
+      box-shadow:var(--shadow);
+      overflow:hidden;
+    }
+    .card .hd{
+      padding:12px 14px;
+      display:flex; align-items:center; justify-content:space-between; gap:10px; flex-wrap:wrap;
+      border-bottom:1px solid rgba(255,255,255,.10);
+      background:rgba(0,0,0,.15);
+    }
+    .card .hd h2{font-size:14px;margin:0}
+    .card .bd{padding:12px 14px}
+    .tabs{
+      display:flex; gap:8px; flex-wrap:wrap;
+    }
+    .tabbtn{
+      appearance:none; border:1px solid var(--stroke); background:rgba(0,0,0,.20);
+      color:var(--mut); padding:8px 10px; border-radius:999px; font-size:12px;
+      cursor:pointer; user-select:none;
+      transition:transform .06s ease, background .15s ease, color .15s ease;
+    }
+    .tabbtn.active{
+      color:var(--text);
+      background:linear-gradient(135deg, rgba(96,165,250,.30), rgba(167,139,250,.28));
+      border-color:rgba(255,255,255,.18);
+    }
+    .tabpane{display:none}
+    .tabpane.active{display:block}
+    .mut{color:var(--mut)}
+    .mini{font-size:12px;color:var(--mut)}
+    .table-wrap{overflow:auto;border-radius:14px;border:1px solid rgba(255,255,255,.10)}
+    table{width:100%;border-collapse:collapse}
+    th,td{padding:10px 10px; vertical-align:middle}
+    th{font-size:11px; text-transform:uppercase; letter-spacing:.08em; color:rgba(238,243,255,.70); background:rgba(0,0,0,.22); position:sticky; top:0}
+    tr{border-bottom:1px solid rgba(255,255,255,.08)}
+    tr:last-child{border-bottom:none}
+    input,select,textarea{
+      width:100%; border-radius:12px;
+      border:1px solid rgba(255,255,255,.14);
+      background:rgba(0,0,0,.20);
+      color:var(--text); padding:8px 10px; font-size:13px;
+      outline:none;
+    }
+    textarea{min-height:38px}
+    .btnq{
+      width:100%;
+      appearance:none; border:1px solid rgba(255,255,255,.18);
+      background:linear-gradient(180deg, rgba(255,255,255,.12), rgba(255,255,255,.06));
+      color:var(--text); border-radius:14px;
+      padding:9px 10px; font-weight:700; font-size:13px;
+      text-align:center; cursor:pointer;
+      transition:transform .06s ease, filter .15s ease;
+    }
+    .btnq:hover{filter:brightness(1.05)}
+    .btnq:active{transform:translateY(1px)}
+    .btnq.primary{
+      border-color:rgba(96,165,250,.30);
+      background:linear-gradient(135deg, rgba(96,165,250,.75), rgba(167,139,250,.70));
+    }
+    .btnq.danger{
+      border-color:rgba(251,113,133,.30);
+      background:linear-gradient(135deg, rgba(251,113,133,.65), rgba(244,63,94,.55));
+    }
+    .row2{display:grid; grid-template-columns:1fr; gap:10px}
+    @media(min-width:992px){ .row2{grid-template-columns:1fr 1fr;} }
+    .bars{display:flex; align-items:flex-end; gap:6px; height:72px; padding:10px; border-radius:14px; border:1px solid rgba(255,255,255,.10); background:rgba(0,0,0,.18)}
+    .bar{flex:1; border-radius:10px 10px 6px 6px; background:linear-gradient(180deg, rgba(96,165,250,.85), rgba(167,139,250,.75)); min-width:6px}
+    .kpi{display:flex; gap:10px; flex-wrap:wrap}
+    .kpi .pill{background:rgba(0,0,0,.18)}
+    .split{display:grid;grid-template-columns:1fr;gap:10px}
+    @media(min-width:992px){.split{grid-template-columns:1.1fr .9fr}}
+    .mono{font-family:ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', 'Courier New', monospace}
+    .link{color:var(--text); text-decoration:none}
+    .link:hover{text-decoration:underline}
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="hero">
+      <div>
+        <h1>Admin Console</h1>
+        <p class="sub">Central command: users, billing, cache, models, backups, security.</p>
+      </div>
+      <div class="kpi">
+        <span class="pill"><strong>{{ cache_stats.entries }}</strong> cache entries</span>
+        <span class="pill"><strong>{{ (cache_stats.bytes/1024)|round(1) }}</strong> KB cached</span>
+        <span class="pill">Maintenance: <strong>{{ flags.MAINTENANCE_MODE }}</strong></span>
+        <span class="pill">Scan: <strong>{{ flags.SCAN_ENABLED }}</strong></span>
+        <span class="pill">API: <strong>{{ flags.API_ENABLED }}</strong></span>
+      </div>
+    </div>
+
+    <div class="card" style="margin-top:12px">
+      <div class="hd">
+        <h2>Console</h2>
+        <div class="tabs" id="tabs">
+          <button class="tabbtn active" data-tab="users">Users</button>
+          <button class="tabbtn" data-tab="analytics">Analytics</button>
+          <button class="tabbtn" data-tab="billing">Billing</button>
+          <button class="tabbtn" data-tab="cache">Cache</button>
+          <button class="tabbtn" data-tab="security">Security</button>
+          <button class="tabbtn" data-tab="tools">Tools</button>
+          <button class="tabbtn" data-tab="audit">Audit</button>
+        </div>
+      </div>
+
+      <div class="bd">
+        <!-- USERS -->
+        <section class="tabpane active" id="tab-users">
+          <div class="mini" style="margin-bottom:10px">Manage plans, bans, and API keys. Counts show queries in last 24h / 72h / all-time.</div>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>User</th><th>Email</th><th>Plan</th><th>Usage</th><th>Status</th><th style="min-width:280px">Actions</th>
+                </tr>
+              </thead>
+              <tbody>
+              {% for u in users %}
+                <tr>
+                  <td class="mono">{{ u.username }}</td>
+                  <td class="mono">{{ u.email }}</td>
+                  <td>
+                    <form method="POST" action="{{ url_for('admin_user_update') }}">
+                      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                      <input type="hidden" name="username" value="{{ u.username }}">
+                      <input type="hidden" name="action" value="save">
+                      <select name="plan" onchange="this.form.submit()">
+                        <option value="free" {% if u.plan=='free' %}selected{% endif %}>free</option>
+                        <option value="pro" {% if u.plan=='pro' %}selected{% endif %}>pro</option>
+                        <option value="corp" {% if u.plan in ['corp','corporate'] %}selected{% endif %}>corp</option>
+                      </select>
+                    </form>
+                  </td>
+                  <td class="mono">{{ u.c24 }} / {{ u.c72 }} / {{ u.call }}</td>
+                  <td>
+                    {% if u.is_admin %}<span class="pill"><strong>admin</strong></span>{% endif %}
+                    {% if u.is_banned %}<span class="pill" style="border-color:rgba(251,113,133,.35)">banned</span>{% else %}<span class="pill" style="border-color:rgba(45,212,191,.35)">active</span>{% endif %}
+                  </td>
+                  <td>
+                    <div class="row2">
+                      <form method="POST" action="{{ url_for('admin_user_update') }}">
+                        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                        <input type="hidden" name="username" value="{{ u.username }}">
+                        <input type="hidden" name="plan" value="{{ u.plan }}">
+                        <input type="hidden" name="action" value="ban">
+                        <div class="row2">
+                          <input name="ban_hours" placeholder="Ban hours (e.g. 24)" value="">
+                          <input name="ban_reason" placeholder="Reason" value="">
+                        </div>
+                        <button class="btnq danger" type="submit" style="margin-top:8px">Ban</button>
+                      </form>
+
+                      <div>
+                        <form method="POST" action="{{ url_for('admin_user_update') }}" style="margin-bottom:8px">
+                          <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                          <input type="hidden" name="username" value="{{ u.username }}">
+                          <input type="hidden" name="plan" value="{{ u.plan }}">
+                          <input type="hidden" name="action" value="unban">
+                          <button class="btnq" type="submit">Unban</button>
+                        </form>
+                        <form method="POST" action="{{ url_for('admin_user_update') }}">
+                          <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                          <input type="hidden" name="username" value="{{ u.username }}">
+                          <input type="hidden" name="plan" value="{{ u.plan }}">
+                          <input type="hidden" name="action" value="revoke_api">
+                          <button class="btnq" type="submit">Revoke API keys</button>
+                        </form>
+                      </div>
+                    </div>
+                  </td>
+                </tr>
+              {% endfor %}
+              </tbody>
+            </table>
+          </div>
+        </section>
+
+        <!-- ANALYTICS -->
+        <section class="tabpane" id="tab-analytics">
+          <div class="split">
+            <div class="card" style="box-shadow:none;background:transparent;border:none">
+              <div class="mini" style="margin-bottom:8px">Total query events (last 14 days)</div>
+              <div class="bars" aria-label="14 day usage">
+                {% set maxv = (usage_series | map(attribute='count') | max) if usage_series else 1 %}
+                {% for p in usage_series %}
+                  {% set h = ( (p.count / (maxv if maxv else 1)) * 68 ) %}
+                  <div class="bar" title="{{ p.day }}: {{ p.count }}" style="height: {{ 6 + h }}px"></div>
+                {% endfor %}
+              </div>
+              <div class="mini" style="margin-top:8px">Today: <strong>{{ usage_series[-1].count if usage_series else 0 }}</strong></div>
+            </div>
+            <div>
+              <div class="mini" style="margin-bottom:8px">Top users (last 24h)</div>
+              <div class="table-wrap">
+                <table>
+                  <thead><tr><th>User</th><th>Count</th></tr></thead>
+                  <tbody>
+                    {% for tu in top24 %}
+                      <tr><td class="mono">{{ tu[0] }}</td><td class="mono">{{ tu[1] }}</td></tr>
+                    {% else %}
+                      <tr><td colspan="2" class="mini">No recent usage.</td></tr>
+                    {% endfor %}
+                  </tbody>
+                </table>
+              </div>
+              <p class="mini" style="margin-top:10px">Tip: paid tiers can have higher daily limits and longer context windows.</p>
+            </div>
+          </div>
+        </section>
+
+        <!-- BILLING -->
+        <section class="tabpane" id="tab-billing">
+          <div class="row2">
+            <div class="card" style="box-shadow:none">
+              <div class="hd"><h2>Plans</h2></div>
+              <div class="bd">
+                <div class="pill">Pro: <strong>$14 / month</strong></div>
+                <div class="pill" style="margin-top:8px">Corporate: <strong>$500 / month</strong> (5–400 users)</div>
+                <p class="mini" style="margin-top:10px">Stripe enabled: <strong>{{ 'true' if stripe_enabled else 'false' }}</strong></p>
+                <p class="mini">Users on paid plans get higher limits + longer context windows.</p>
+              </div>
+            </div>
+            <div class="card" style="box-shadow:none">
+              <div class="hd"><h2>Quick links</h2></div>
+              <div class="bd">
+                <a class="btnq primary link" href="{{ url_for('dashboard') }}">Back to Dashboard</a>
+                <div style="height:10px"></div>
+                <a class="btnq link" href="{{ url_for('register') }}">Registration Page</a>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <!-- CACHE -->
+        <section class="tabpane" id="tab-cache">
+          <div class="row2">
+            <div>
+              <div class="mini" style="margin-bottom:8px">Purge cache by prefix (endpoint or key prefix). Empty purges all.</div>
+              <form method="POST" action="{{ url_for('admin_cache_purge') }}">
+                <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                <input name="prefix" placeholder="Prefix (optional)" value="">
+                <button class="btnq danger" type="submit" style="margin-top:10px">Purge cache</button>
+              </form>
+              <p class="mini" style="margin-top:10px">Cache entries: <strong>{{ cache_stats.entries }}</strong></p>
+            </div>
+            <div>
+              <div class="mini" style="margin-bottom:8px">Notes</div>
+              <div class="pill">DB-backed caching</div>
+              <div class="pill" style="margin-top:8px">Safe purge via parameterized queries</div>
+              <div class="pill" style="margin-top:8px">External provider calls hardened via httpx</div>
+            </div>
+          </div>
+        </section>
+
+        <!-- SECURITY -->
+        <section class="tabpane" id="tab-security">
+          <div class="mini" style="margin-bottom:10px">Feature flags are stored in the config table. Maintenance mode blocks non-admins (except login/logout).</div>
+          <form method="POST" action="{{ url_for('admin_flags_update') }}">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+            <div class="row2">
+              <label class="mini"><input type="checkbox" name="MAINTENANCE_MODE" {% if flags.MAINTENANCE_MODE in ['true','1','yes','on'] %}checked{% endif %}> Maintenance Mode</label>
+              <label class="mini"><input type="checkbox" name="REGISTRATION_ENABLED" {% if flags.REGISTRATION_ENABLED in ['true','1','yes','on'] %}checked{% endif %}> Registration Enabled</label>
+              <label class="mini"><input type="checkbox" name="SCAN_ENABLED" {% if flags.SCAN_ENABLED in ['true','1','yes','on'] %}checked{% endif %}> Scan Enabled</label>
+              <label class="mini"><input type="checkbox" name="WEATHER_ENABLED" {% if flags.WEATHER_ENABLED in ['true','1','yes','on'] %}checked{% endif %}> Weather Enabled</label>
+              <label class="mini"><input type="checkbox" name="API_ENABLED" {% if flags.API_ENABLED in ['true','1','yes','on'] %}checked{% endif %}> API Enabled</label>
+            </div>
+            <button class="btnq primary" type="submit" style="margin-top:10px">Save Security Flags</button>
+          </form>
+        </section>
+
+        <!-- TOOLS -->
+        <section class="tabpane" id="tab-tools">
+          <div class="row2">
+            <div>
+              <a class="btnq link" href="{{ url_for('admin_local_llm') }}">Local LLM Manager</a>
+              <div style="height:10px"></div>
+              <a class="btnq link" href="{{ url_for('admin_blog_backup_page') }}">Blog Backup & Restore</a>
+              <p class="mini" style="margin-top:10px">These tools remain available as dedicated pages, but are now centralized here for navigation.</p>
+            </div>
+            <div>
+              <div class="mini" style="margin-bottom:6px">Quick actions</div>
+              <a class="btnq primary link" href="{{ url_for('weather_page') }}">Weather Intelligence</a>
+              <div style="height:10px"></div>
+              <a class="btnq link" href="{{ url_for('settings') }}">System Settings</a>
+            </div>
+          </div>
+
+          <div class="row2" style="margin-top:12px">
+            <div class="card" style="background:rgba(0,0,0,.14); border:1px solid rgba(255,255,255,.10); box-shadow:none">
+              <div class="hd"><h2>Impersonation</h2><div class="mini">Admin-only diagnostic</div></div>
+              <div class="bd">
+                <form method="POST" action="{{ url_for('admin_impersonate') }}">
+                  <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                  <input name="username" placeholder="Username to impersonate">
+                  <button class="btnq primary" type="submit" style="margin-top:10px">Impersonate</button>
+                </form>
+                <form method="POST" action="{{ url_for('admin_impersonate_stop') }}" style="margin-top:10px">
+                  <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                  <button class="btnq" type="submit">Stop Impersonation</button>
+                </form>
+                <p class="mini" style="margin-top:10px">Impersonation is logged in Audit and requires CSRF + admin session.</p>
+              </div>
+            </div>
+
+            <div class="card" style="background:rgba(0,0,0,.14); border:1px solid rgba(255,255,255,.10); box-shadow:none">
+              <div class="hd"><h2>Exports</h2><div class="mini">CSV for offline review</div></div>
+              <div class="bd">
+                <a class="btnq link" href="{{ url_for('admin_export_users_csv') }}">Export Users CSV</a>
+                <div style="height:10px"></div>
+                <a class="btnq link" href="{{ url_for('admin_export_usage_csv') }}">Export Usage CSV</a>
+                <div style="height:10px"></div>
+                <form method="POST" action="{{ url_for('admin_dispatch_alerts') }}">
+                  <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                  <button class="btnq" type="submit">Dispatch Alerts (manual)</button>
+                </form>
+                <p class="mini" style="margin-top:10px">Use the dispatch endpoint with a cron job for automation.</p>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <!-- AUDIT -->
+        <section class="tabpane" id="tab-audit">
+          <div class="mini" style="margin-bottom:10px">Recent admin/security events.</div>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>Time</th><th>Actor</th><th>Action</th><th>Target</th><th>Meta</th></tr></thead>
+              <tbody>
+                {% for a in audits %}
+                  <tr>
+                    <td class="mono">{{ (a[0] | int) | datetimeformat }}</td>
+                    <td class="mono">{{ a[1] }}</td>
+                    <td class="mono">{{ a[2] }}</td>
+                    <td class="mono">{{ a[3] }}</td>
+                    <td class="mono" style="max-width:420px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">{{ a[4] }}</td>
+                  </tr>
+                {% else %}
+                  <tr><td colspan="5" class="mini">No audit events yet.</td></tr>
+                {% endfor %}
+              </tbody>
+            </table>
+          </div>
+        </section>
+
+      </div>
+    </div>
+  </div>
+
+<script>
+(function(){
+  const btns = Array.from(document.querySelectorAll('.tabbtn'));
+  const panes = {
+    users: document.getElementById('tab-users'),
+    analytics: document.getElementById('tab-analytics'),
+    billing: document.getElementById('tab-billing'),
+    cache: document.getElementById('tab-cache'),
+    security: document.getElementById('tab-security'),
+    tools: document.getElementById('tab-tools'),
+    audit: document.getElementById('tab-audit'),
+  };
+  function setTab(name){
+    btns.forEach(b=>b.classList.toggle('active', b.dataset.tab===name));
+    Object.keys(panes).forEach(k=>panes[k].classList.toggle('active', k===name));
+    try{ localStorage.setItem('qrs_admin_tab', name); }catch(e){}
+  }
+  btns.forEach(b=>b.addEventListener('click', ()=>setTab(b.dataset.tab)));
+  let saved = null;
+  try{ saved = localStorage.getItem('qrs_admin_tab'); }catch(e){}
+  if(saved && panes[saved]) setTab(saved);
+})();
+</script>
+</body>
+</html>
+""",
+csrf_token=csrf_token,
+users=users,
+stripe_enabled=stripe_enabled,
+cache_stats=cache_stats,
+usage_series=usage_series,
+top24=top24,
+flags=SimpleNamespace(**flags),
+audits=audits)
+
+
+
+@app.post("/admin/users/update")
+def admin_user_update():
+    guard = _require_admin()
+    if guard:
+        return guard
+    token = request.form.get("csrf_token", "")
+    try:
+        validate_csrf(token)
+    except ValidationError:
+        flash("CSRF invalid.", "danger")
+        return redirect(url_for("admin_console"))
+
+    username = normalize_username(request.form.get("username", ""))
+    action = request.form.get("action", "save")
+    plan = (request.form.get("plan", "free") or "free").strip().lower()
+    ban_reason = (request.form.get("ban_reason", "") or "").strip()
+    ban_hours_raw = (request.form.get("ban_hours", "") or "").strip()
+
+    if plan not in ("free", "pro", "corp", "corporate"):
+        plan = "free"
+
+    ban_until = None
+    if ban_hours_raw:
+        try:
+            hrs = int(float(ban_hours_raw))
+            if hrs > 0:
+                ban_until = _now_ts() + hrs * 3600
+        except Exception:
+            ban_until = None
+
+    with db_connect(DB_FILE) as db:
+        cur = db.cursor()
+        if action == "ban":
+            cur.execute(
+                "UPDATE users SET is_banned=1, banned_until=?, banned_reason=? WHERE username=?",
+                (ban_until, ban_reason[:300], username),
+            )
+            audit_log_event("admin_user_ban", actor=session.get("username", ""), target=username, meta={"until": ban_until, "reason": ban_reason[:300]})
+        elif action == "unban":
+            cur.execute("UPDATE users SET is_banned=0, banned_until=NULL, banned_reason=NULL WHERE username=?", (username,))
+            audit_log_event("admin_user_unban", actor=session.get("username", ""), target=username)
+        elif action == "revoke_api":
+            cur.execute("UPDATE api_keys SET revoked=1 WHERE user_id = (SELECT id FROM users WHERE username=?)", (username,))
+            audit_log_event("admin_user_revoke_api", actor=session.get("username", ""), target=username)
+
+        # always allow plan update for admins
+        cur.execute("UPDATE users SET plan=? WHERE username=?", (plan, username))
+        db.commit()
+
+    flash("User updated.", "success")
+    return redirect(url_for("admin_console"))
+
+
+@app.post("/admin/cache/purge")
+def admin_cache_purge():
+    guard = _require_admin()
+    if guard:
+        return guard
+    token = request.form.get("csrf_token", "")
+    try:
+        validate_csrf(token)
+    except ValidationError:
+        flash("CSRF invalid.", "danger")
+        return redirect(url_for("admin_console"))
+    prefix = (request.form.get("prefix", "") or "").strip()
+    with db_connect(DB_FILE) as db:
+        if prefix:
+            db.execute("DELETE FROM api_cache WHERE endpoint LIKE ? OR cache_key LIKE ?", (f"{prefix}%", f"{prefix}%"))
+        else:
+            db.execute("DELETE FROM api_cache")
+        db.commit()
+    audit_log_event("admin_cache_purge", actor=session.get("username", ""), target=prefix or "*")
+    flash("Cache purged.", "success")
+    return redirect(url_for("admin_console"))
+
+
+@app.post("/admin/flags/update")
+def admin_flags_update():
+    guard = _require_admin()
+    if guard:
+        return guard
+    token = request.form.get("csrf_token", "")
+    try:
+        validate_csrf(token)
+    except ValidationError:
+        flash("CSRF invalid.", "danger")
+        return redirect(url_for("admin_console"))
+    updates = {}
+    for k in ("MAINTENANCE_MODE", "SCAN_ENABLED", "WEATHER_ENABLED", "API_ENABLED", "REGISTRATION_ENABLED"):
+        updates[k] = "true" if request.form.get(k) == "on" else "false"
+    with db_connect(DB_FILE) as db:
+        for k, v in updates.items():
+            set_feature_flag(db, k, v)
+    audit_log_event("admin_flags_update", actor=session.get("username", ""), meta=updates)
+    flash("Settings updated.", "success")
+    return redirect(url_for("admin_console"))
+
+
+@app.post("/admin/impersonate")
+def admin_impersonate():
+    guard = _require_admin()
+    if guard:
+        return guard
+    token = request.form.get("csrf_token", "")
+    try:
+        validate_csrf(token)
+    except ValidationError:
+        flash("CSRF invalid.", "danger")
+        return redirect(url_for("admin_console"))
+    target = normalize_username(request.form.get("username", ""))
+    if not target:
+        flash("Missing username.", "warning")
+        return redirect(url_for("admin_console"))
+    # Cannot impersonate a different admin unless explicitly allowed
+    with db_connect(DB_FILE) as db:
+        row = db.execute("SELECT COALESCE(is_admin,0), COALESCE(is_banned,0) FROM users WHERE username = ?", (target,)).fetchone()
+    if not row:
+        flash("User not found.", "warning")
+        return redirect(url_for("admin_console"))
+    if int(row[0] or 0) == 1 and target != session.get("username"):
+        flash("Refusing to impersonate another admin.", "danger")
+        return redirect(url_for("admin_console"))
+    if int(row[1] or 0) == 1:
+        flash("Cannot impersonate banned user.", "danger")
+        return redirect(url_for("admin_console"))
+
+    session.setdefault("admin_real_username", session.get("username"))
+    session["admin_impersonating"] = True
+    session["username"] = target
+    session["is_admin"] = False
+    audit_log_event("admin_impersonate_start", actor=session.get("admin_real_username", ""), target=target)
+    flash("Impersonation active.", "success")
+    return redirect(url_for("dashboard"))
+
+
+@app.post("/admin/impersonate/stop")
+def admin_impersonate_stop():
+    token = request.form.get("csrf_token", "")
+    try:
+        validate_csrf(token)
+    except ValidationError:
+        flash("CSRF invalid.", "danger")
+        return redirect(url_for("login"))
+    real = session.get("admin_real_username")
+    if not real:
+        flash("No active impersonation.", "warning")
+        return redirect(url_for("login"))
+    session.clear()
+    session["username"] = real
+    session["is_admin"] = True
+    audit_log_event("admin_impersonate_stop", actor=real)
+    flash("Returned to admin session.", "success")
+    return redirect(url_for("admin_console"))
+
+
+@app.get("/admin/export/users.csv")
+def admin_export_users_csv():
+    guard = _require_admin()
+    if guard:
+        return guard
+    with db_connect(DB_FILE) as db:
+        rows = db.execute(
+            "SELECT username, COALESCE(email,''), COALESCE(plan,'free'), COALESCE(is_admin,0), COALESCE(is_banned,0), COALESCE(banned_until,''), COALESCE(risk_score,0), COALESCE(throttle_until,'') FROM users ORDER BY username ASC"
+        ).fetchall()
+    out = ["username,email,plan,is_admin,is_banned,banned_until,risk_score,throttle_until"]
+    for r in rows:
+        out.append(",".join([
+            str(r[0] or ""),
+            str(r[1] or "").replace(",", " "),
+            str(r[2] or ""),
+            str(int(r[3] or 0)),
+            str(int(r[4] or 0)),
+            str(r[5] or ""),
+            str(r[6] or 0),
+            str(r[7] or ""),
+        ]))
+    audit_log_event("admin_export_users", actor=session.get("username", ""))
+    return Response("\n".join(out) + "\n", mimetype="text/csv", headers={"Content-Disposition": "attachment; filename=users.csv"})
+
+
+@app.get("/admin/export/usage.csv")
+def admin_export_usage_csv():
+    guard = _require_admin()
+    if guard:
+        return guard
+    since = _now_ts() - 72 * 3600
+    with db_connect(DB_FILE) as db:
+        rows = db.execute(
+            "SELECT username, kind, ts FROM user_query_events WHERE ts >= ? ORDER BY ts DESC LIMIT 50000",
+            (since,),
+        ).fetchall()
+    out = ["username,kind,ts"]
+    for r in rows:
+        out.append(f"{r[0]},{r[1]},{int(r[2] or 0)}")
+    audit_log_event("admin_export_usage", actor=session.get("username", ""), meta={"window_hours": 72, "rows": len(rows)})
+    return Response("\n".join(out) + "\n", mimetype="text/csv", headers={"Content-Disposition": "attachment; filename=usage_72h.csv"})
+
+
+def _alerts_dispatch_allowed() -> bool:
+    # Admin session OR a cron token.
+    if session.get("is_admin"):
+        return True
+    token = (request.args.get("token", "") or "").strip()
+    expected = (os.getenv("ADMIN_CRON_TOKEN", "") or "").strip()
+    if expected and token and secrets.compare_digest(token, expected):
+        return True
+    return False
+
+
+@app.post("/admin/alerts/dispatch")
+def admin_dispatch_alerts():
+    guard = _require_admin()
+    if guard:
+        return guard
+    token = request.form.get("csrf_token", "")
     try:
         with db_connect(DB_FILE) as db:
             cur = db.cursor()
@@ -10479,34 +11251,142 @@ def register():
     google_auth_available = _google_auth_available(registration_enabled)
     captcha_widget = _captcha_widget_html()
 
-    error_message = ""
-    form = RegisterForm()
+
+def _verify_google_id_token(id_token: str) -> tuple[bool, dict[str, Any], str]:
+    if not id_token:
+        return False, {}, "Missing Google ID token."
+
+    tokeninfo_url = "https://oauth2.googleapis.com/tokeninfo"
     try:
-        if request.method == 'GET':
-            hinted = request.args.get('email','').strip()
-            if hinted and not form.email.data:
-                form.email.data = hinted
+        response = httpx.get(tokeninfo_url, params={"id_token": id_token}, timeout=8.0)
     except Exception:
-        pass
+        logger.exception("Google token validation request failed")
+        return False, {}, "Google verification failed."
+
+    if response.status_code != 200:
+        return False, {}, "Google verification failed."
+
+    payload = response.json()
+    aud = payload.get("aud", "")
+    sub = payload.get("sub", "")
+    email = payload.get("email", "")
+    email_verified = payload.get("email_verified", "false")
+    exp_raw = payload.get("exp", "0")
+
+    if aud != os.getenv("GOOGLE_CLIENT_ID", ""):
+        return False, {}, "Google audience mismatch."
+    if not sub:
+        return False, {}, "Google subject missing."
+    if str(email_verified).lower() not in ("true", "1"):
+        return False, {}, "Google email is not verified."
+    try:
+        if int(exp_raw) <= int(time.time()):
+            return False, {}, "Google token expired."
+    except Exception:
+        return False, {}, "Google token expiry invalid."
+
+    return True, payload, ""
+
+@app.route('/auth/google/start')
+def google_start():
+    if not _google_auth_available(is_registration_enabled()):
+        flash("Google sign-in is not available.", "warning")
+        return redirect(url_for('login'))
+
+    state = secrets.token_urlsafe(32)
+    nonce = secrets.token_urlsafe(32)
+    session["google_oauth_state"] = state
+    session["google_oauth_nonce"] = nonce
+
+    params = {
+        "client_id": os.getenv("GOOGLE_CLIENT_ID", ""),
+        "redirect_uri": _google_redirect_uri(),
+        "response_type": "code",
+        "scope": "openid email profile",
+        "state": state,
+        "nonce": nonce,
+        "prompt": "select_account",
+    }
+    auth_url = f"https://accounts.google.com/o/oauth2/v2/auth?{urlencode(params)}"
+    return redirect(auth_url)
+
+@app.route('/auth/google/callback')
+def google_callback():
+    if not _google_auth_available(is_registration_enabled()):
+        flash("Google sign-in is not available.", "warning")
+        return redirect(url_for('login'))
+
+    state = request.args.get("state", "")
+    code = request.args.get("code", "")
+    expected_state = session.pop("google_oauth_state", None)
+    session.pop("google_oauth_nonce", None)
+    if not expected_state or not secrets.compare_digest(state, expected_state):
+        flash("OAuth state mismatch.", "danger")
+        return redirect(url_for('login'))
+    if not code:
+        flash("Missing authorization code.", "danger")
+        return redirect(url_for('login'))
+
+    token_url = "https://oauth2.googleapis.com/token"
+    token_payload = {
+        "code": code,
+        "client_id": os.getenv("GOOGLE_CLIENT_ID", ""),
+        "client_secret": os.getenv("GOOGLE_CLIENT_SECRET", ""),
+        "redirect_uri": _google_redirect_uri(),
+        "grant_type": "authorization_code",
+    }
+    try:
+        token_res = httpx.post(token_url, data=token_payload, timeout=10.0)
+    except Exception:
+        logger.exception("Google OAuth token exchange failed")
+        flash("Google token exchange failed.", "danger")
+        return redirect(url_for('login'))
+
+    if token_res.status_code != 200:
+        flash("Google token exchange failed.", "danger")
+        return redirect(url_for('login'))
+
+    token_data = token_res.json()
+    id_token = token_data.get("id_token", "")
+    ok, payload, error = _verify_google_id_token(id_token)
+    if not ok:
+        flash(error or "Google validation failed.", "danger")
+        return redirect(url_for('login'))
+
+    success, message = authenticate_google_user(payload.get("sub", ""), payload.get("email", ""))
+    if not success:
+        flash(message, "danger")
+        return redirect(url_for('login'))
+
+    flash(message, "success")
+    return redirect(url_for('dashboard'))
+
+
+@app.route('/login', methods=['GET', 'POST'])
+def login():
+    error_message = ""
+    form = LoginForm()
+    registration_enabled = is_registration_enabled()
+    google_auth_available = _google_auth_available(registration_enabled)
+    captcha_widget = _captcha_widget_html()
+
     if form.validate_on_submit():
         username = form.username.data
         password = form.password.data
-        invite_code = form.invite_code.data if not registration_enabled else None
 
         if _captcha_enabled() and not _captcha_ok():
             token = _captcha_token_from_request()
-            ok, err = verify_captcha_sync(token, remoteip=request.remote_addr or "", action="register")
+            ok, err = verify_captcha_sync(token, remoteip=request.remote_addr or "", action="login")
             if not ok:
                 error_message = err or "Captcha verification failed."
             else:
                 _set_captcha_ok()
 
-        if not error_message:
-            success, message = register_user(username, password, invite_code, email=email)
-            if success:
-                flash(message, "success")
-                return redirect(url_for('login'))
-            error_message = message
+        if not error_message and authenticate_user(username, password):
+            session['username'] = normalize_username(username)
+            return redirect(url_for('dashboard'))
+        elif not error_message:
+            error_message = "Signal mismatch. Your credentials did not align with the vault."
 
     return render_template_string("""
 <!DOCTYPE html>
@@ -10768,11 +11648,22 @@ def settings():
             {% else %}
                 <span class="badge badge-off">DISABLED</span>
             {% endif %}
-            <small style="opacity:.8;">(from ENV: REGISTRATION_ENABLED={{ registration_env_value }})</small>
-        </div>
-
-        <div class="alert-info">
-            Registration is controlled via environment only. Set <code>REGISTRATION_ENABLED=true</code> or <code>false</code> and restart the app.
+            <form method="POST" novalidate>
+                {{ form.hidden_tag() }}
+                <div class="form-group">
+                    {{ form.username.label }}
+                    {{ form.username(class="form-control", placeholder="Enter your username") }}
+                </div>
+                <div class="form-group">
+                    {{ form.password.label }}
+                    {{ form.password(class="form-control", placeholder="Enter your password") }}
+                </div>
+                {{ form.submit(class="btn btn-primary btn-block") }}
+            </form>
+            {% if google_auth_available %}
+            <a class="btn btn-light btn-block mt-3" href="{{ url_for('google_start') }}">Continue with Google</a>
+            {% endif %}
+            <p class="mt-3 text-center">Don't have an account? <a href="{{ url_for('register') }}">Register here</a></p>
         </div>
 
         {% if message %}
@@ -10808,6 +11699,502 @@ def settings():
     <script src="{{ url_for('static', filename='js/bootstrap.min.js') }}"
             integrity="sha256-ecWZ3XYM7AwWIaGvSdmipJ2l1F4bN9RXW6zgpeAiZYI=" crossorigin="anonymous"></script>
 
+</body>
+</html>
+    """, form=form, error_message=error_message, registration_enabled=registration_enabled,
+       google_auth_available=google_auth_available, captcha_widget=captcha_widget, password_requirements=PASSWORD_REQUIREMENTS_TEXT)
+
+@app.route('/register', methods=['GET', 'POST'])
+def register():
+    registration_enabled = is_registration_enabled()
+    google_auth_available = _google_auth_available(registration_enabled)
+    captcha_widget = _captcha_widget_html()
+
+    error_message = ""
+    form = RegisterForm()
+    try:
+        if request.method == 'GET':
+            hinted = request.args.get('email','').strip()
+            if hinted and not form.email.data:
+                form.email.data = hinted
+    except Exception:
+        pass
+    if form.validate_on_submit():
+        username = form.username.data
+        password = form.password.data
+        invite_code = form.invite_code.data if not registration_enabled else None
+
+        if _captcha_enabled() and not _captcha_ok():
+            token = _captcha_token_from_request()
+            ok, err = verify_captcha_sync(token, remoteip=request.remote_addr or "", action="register")
+            if not ok:
+                error_message = err or "Captcha verification failed."
+            else:
+                _set_captcha_ok()
+
+        if not error_message:
+            success, message = register_user(username, password, invite_code, email=email)
+            if success:
+                flash(message, "success")
+                return redirect(url_for('login'))
+            error_message = message
+
+
+@app.route('/view_report/<int:report_id>', methods=['GET'])
+def view_report(report_id):
+    if 'username' not in session:
+        logger.warning(
+            f"Unauthorized access attempt to view_report by user: {session.get('username')}"
+        )
+        return redirect(url_for('login'))
+
+    user_id = get_user_id(session['username'])
+    report = get_hazard_report_by_id(report_id, user_id)
+    if not report:
+        logger.error(
+            f"Report not found or access denied for report_id: {report_id} by user_id: {user_id}"
+        )
+        return "Report not found or access denied.", 404
+
+    trigger_words = {
+        'severity': {
+            'low': -7,
+            'medium': -0.2,
+            'high': 14
+        },
+        'urgency': {
+            'level': {
+                'high': 14
+            }
+        },
+        'low': -7,
+        'medium': -0.2,
+        'metal': 11,
+    }
+
+    text = (report['result'] or "").lower()
+    words = re.findall(r'\w+', text)
+
+    total_weight = 0
+    for w in words:
+        if w in trigger_words.get('severity', {}):
+            total_weight += trigger_words['severity'][w]
+        elif w == 'metal':
+            total_weight += trigger_words['metal']
+
+    if 'urgency level' in text and 'high' in text:
+        total_weight += trigger_words['urgency']['level']['high']
+
+    max_factor = 30.0
+    if total_weight <= 0:
+        ratio = 0.0
+    else:
+        ratio = min(total_weight / max_factor, 1.0)
+
+    # If local llama is used and it produced a one-word risk label, map directly to the wheel.
+    try:
+        if (report.get("model_used") == "llama_local"):
+            lbl = (text or "").strip()
+            if lbl == "low":
+                ratio = 0.20
+            elif lbl == "medium":
+                ratio = 0.55
+            elif lbl == "high":
+                ratio = 0.90
+    except Exception:
+        pass
+
+    def interpolate_color(color1, color2, t):
+        c1 = int(color1[1:], 16)
+        c2 = int(color2[1:], 16)
+        r1, g1, b1 = (c1 >> 16) & 0xff, (c1 >> 8) & 0xff, c1 & 0xff
+        r2, g2, b2 = (c2 >> 16) & 0xff, (c2 >> 8) & 0xff, c2 & 0xff
+        r = int(r1 + (r2 - r1) * t)
+        g = int(g1 + (g2 - g1) * t)
+        b = int(b1 + (b2 - b1) * t)
+        return f"#{r:02x}{g:02x}{b:02x}"
+
+    green = "#56ab2f"
+    yellow = "#f4c95d"
+    red = "#ff9068"
+
+    if ratio < 0.5:
+        t = ratio / 0.5
+        wheel_color = interpolate_color(green, yellow, t)
+    else:
+        t = (ratio - 0.5) / 0.5
+        wheel_color = interpolate_color(yellow, red, t)
+
+    report_md = markdown(report['result'])
+    allowed_tags = list(bleach.sanitizer.ALLOWED_TAGS) + [
+        'p', 'ul', 'ol', 'li', 'strong', 'em', 'h1', 'h2', 'h3', 'h4', 'h5',
+        'h6', 'br'
+    ]
+    report_html = bleach.clean(report_md, tags=allowed_tags)
+    report_html_escaped = report_html.replace('\\', '\\\\')
+    csrf_token = generate_csrf()
+
+    return render_template_string(r"""
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Report Details</title>
+    <style>
+        #view-report-container .btn-custom {
+            width: 100%;
+            padding: 15px;
+            font-size: 1.2rem;
+            background-color: #007bff;
+            border: none;
+            color: #ffffff;
+            border-radius: 5px;
+            transition: background-color 0.3s;
+        }
+        #view-report-container .btn-custom:hover {
+            background-color: #0056b3;
+        }
+        #view-report-container .btn-danger {
+            width: 100%;
+            padding: 10px;
+            font-size: 1rem;
+        }
+
+        .hazard-wheel {
+            display: inline-block;
+            width: 320px; 
+            height: 320px; 
+            border-radius: 50%;
+            margin-right: 8px;
+            box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+            border: 2px solid #ffffff;
+            background: {{ wheel_color }};
+            background-size: cover;
+            vertical-align: middle;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            color: #ffffff;
+            font-weight: bold;
+            font-size: 1.2rem;
+            text-transform: capitalize;
+            margin: auto;
+            animation: breathing 3s infinite ease-in-out; /* Breathing animation */
+        }
+
+        @keyframes breathing {
+            0% { transform: scale(1); }
+            50% { transform: scale(1.1); }
+            100% { transform: scale(1); }
+        }
+
+        .hazard-summary {
+            text-align: center;
+            margin-top: 20px;
+        }
+    </style>
+</head>
+<body>
+    
+    <nav class="navbar navbar-expand-lg navbar-dark">
+        <a class="navbar-brand" href="{{ url_for('home') }}">QRS</a>
+        <button class="navbar-toggler" type="button" data-toggle="collapse" data-target="#navbarNav"
+            aria-controls="navbarNav" aria-expanded="false" aria-label="Toggle navigation">
+            <span class="navbar-toggler-icon"></span>
+        </button>
+
+        <div class="collapse navbar-collapse justify-content-end" id="navbarNav">
+            <ul class="navbar-nav">
+                <li class="nav-item"><a class="nav-link" href="{{ url_for('login') }}">Login</a></li>
+                <li class="nav-item"><a class="nav-link active" href="{{ url_for('register') }}">Register</a></li>
+            </ul>
+        </div>
+    </nav>
+
+    <div class="container">
+        <div class="walkd shadow">
+            <div class="brand">QRS</div>
+            <h3 class="text-center">Register</h3>
+            {% if error_message %}
+            <p class="error-message text-center">{{ error_message }}</p>
+            {% endif %}
+            <form method="POST" novalidate>
+                {{ form.hidden_tag() }}
+                <div class="form-group">
+                    {{ form.username.label }}
+                    {{ form.username(class="form-control", placeholder="Choose a username") }}
+                </div>
+                <div class="form-group">
+                    {{ form.password.label }}
+                    {{ form.password(class="form-control", placeholder="Choose a password") }}
+                    <small id="passwordStrength" class="form-text">{{ password_requirements }}</small>
+                </div>
+                {% if not registration_enabled %}
+                <div class="form-group">
+                    {{ form.invite_code.label }}
+                    {{ form.invite_code(class="form-control", placeholder="Enter invite code") }}
+                </div>
+            </div>
+            <div id="reportMarkdown">{{ report_html_escaped | safe }}</div>
+            <h4>Route Details</h4>
+            <p><span class="report-text-bold">Date:</span> {{ report['timestamp'] }}</p>
+            <p><span class="report-text-bold">Location:</span> {{ report['latitude'] }}, {{ report['longitude'] }}</p>
+            <p><span class="report-text-bold">Nearest City:</span> {{ report['street_name'] }}</p>
+            <p><span class="report-text-bold">Vehicle Type:</span> {{ report['vehicle_type'] }}</p>
+            <p><span class="report-text-bold">Destination:</span> {{ report['destination'] }}</p>
+            <p><span class="report-text-bold">Model Used:</span> {{ report['model_used'] }}</p>
+            <div aria-live="polite" aria-atomic="true" id="speechStatus" class="sr-only">
+                Speech synthesis is not active.
+            </div>
+        </div>
+    </div>
+</div>
+<script>
+    let synth = window.speechSynthesis;
+    let utterances = [];
+    let currentUtteranceIndex = 0;
+    let isSpeaking = false;
+    let availableVoices = [];
+    let selectedVoice = null;
+    let voicesLoaded = false;
+    let originalReportHTML = null;
+
+    <script>
+    document.addEventListener('DOMContentLoaded', function () {
+        var toggler = document.querySelector('.navbar-toggler');
+        var nav = document.getElementById('navbarNav');
+        if (toggler && nav) {
+            toggler.addEventListener('click', function () {
+                var isShown = nav.classList.toggle('show');
+                toggler.setAttribute('aria-expanded', isShown ? 'true' : 'false');
+            });
+        }
+    });
+    
+    // Create strong password helper (client-side convenience)
+    (function(){
+      function randChar(set){
+        const a = new Uint32Array(1);
+        (window.crypto||window.msCrypto).getRandomValues(a);
+        return set[a[0] % set.length];
+      }
+      function gen(len){
+        const U="ABCDEFGHJKLMNPQRSTUVWXYZ";
+        const L="abcdefghijkmnopqrstuvwxyz";
+        const D="23456789";
+        const S="!@#$%^&*()-_=+[]{}:,.?/";
+        let out = randChar(U)+randChar(L)+randChar(D)+randChar(S);
+        const all=U+L+D+S;
+        for(let i=out.length;i<len;i++) out += randChar(all);
+        // shuffle
+        out = out.split('').sort(()=>{const a=new Uint32Array(1); crypto.getRandomValues(a); return (a[0] / 2**32)-0.5;}).join('');
+        return out;
+      }
+      const btn = document.getElementById('genPw');
+      if(!btn) return;
+      btn.addEventListener('click', ()=>{
+        const inp = document.getElementById('password');
+        if(!inp) return;
+        const pw = gen(24);
+        inp.value = pw;
+        inp.dispatchEvent(new Event('input', {bubbles:true}));
+        try{ inp.focus(); inp.setSelectionRange(0, pw.length); }catch(e){}
+      });
+    })();
+
+</script>
+</body>
+</html>
+    """, form=form, error_message=error_message, registration_enabled=registration_enabled,
+       google_auth_available=google_auth_available, captcha_widget=captcha_widget, password_requirements=PASSWORD_REQUIREMENTS_TEXT)
+
+@app.route('/settings', methods=['GET', 'POST'])
+def settings():
+    
+
+    import os  
+
+    if 'is_admin' not in session or not session.get('is_admin'):
+        return redirect(url_for('dashboard'))
+
+    message = ""
+    new_invite_code = None
+    form = SettingsForm()
+
+    
+    def _read_registration_from_env():
+        val = os.getenv('REGISTRATION_ENABLED', 'false')
+        return (val, str(val).strip().lower() in ('1', 'true', 'yes', 'on'))
+
+    env_val, registration_enabled = _read_registration_from_env()
+
+    if request.method == 'POST':
+        action = request.form.get('action')
+        if action == 'generate_invite_code':
+            new_invite_code = generate_secure_invite_code()
+            with db_connect(DB_FILE) as db:
+                cursor = db.cursor()
+                cursor.execute("INSERT INTO invite_codes (code) VALUES (?)",
+                               (new_invite_code,))
+                db.commit()
+            message = f"New invite code generated: {new_invite_code}"
+
+        
+        env_val, registration_enabled = _read_registration_from_env()
+
+   
+    invite_codes = []
+    with db_connect(DB_FILE) as db:
+        cursor = db.cursor()
+        cursor.execute("SELECT code FROM invite_codes WHERE is_used = 0")
+        invite_codes = [row[0] for row in cursor.fetchall()]
+
+    return render_template_string("""
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Settings - QRS</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1, shrink-to-fit=no">
+    <link href="{{ url_for('static', filename='css/bootstrap.min.css') }}" rel="stylesheet"
+          integrity="sha256-Ww++W3rXBfapN8SZitAvc9jw2Xb+Ixt0rvDsmWmQyTo=" crossorigin="anonymous">
+    <link href="{{ url_for('static', filename='css/roboto.css') }}" rel="stylesheet"
+          integrity="sha256-Sc7BtUKoWr6RBuNTT0MmuQjqGVQwYBK+21lB58JwUVE=" crossorigin="anonymous">
+    <link href="{{ url_for('static', filename='css/orbitron.css') }}" rel="stylesheet"
+          integrity="sha256-3mvPl5g2WhVLrUV4xX3KE8AV8FgrOz38KmWLqKXVh00" crossorigin="anonymous">
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/fontawesome.min.css') }}"
+          integrity="sha256-rx5u3IdaOCszi7Jb18XD9HSn8bNiEgAqWJbdBvIYYyU=" crossorigin="anonymous">
+    <style>
+        body { background:#121212; color:#fff; font-family:'Roboto',sans-serif; }
+        .sidebar { position:fixed; top:0; left:0; height:100%; width:220px; background:#1f1f1f; padding-top:60px; border-right:1px solid #333; transition:width .3s; }
+        .sidebar a { color:#bbb; padding:15px 20px; text-decoration:none; display:block; font-size:1rem; transition:background-color .3s, color .3s; }
+        .sidebar a:hover, .sidebar a.active { background:#333; color:#fff; }
+        .content { margin-left:220px; padding:20px; transition:margin-left .3s; }
+        .navbar-brand { font-size:1.5rem; color:#fff; text-align:center; display:block; margin-bottom:20px; font-family:'Orbitron',sans-serif; }
+        .card { padding:30px; background:rgba(255,255,255,.1); border:none; border-radius:15px; }
+        .message { color:#4dff4d; }
+        .status { margin:10px 0 20px; }
+        .badge { display:inline-block; padding:.35em .6em; border-radius:.35rem; font-weight:bold; }
+        .badge-ok { background:#00cc00; color:#000; }
+        .badge-off { background:#cc0000; color:#fff; }
+        .alert-info { background:#0d6efd22; border:1px solid #0d6efd66; color:#cfe2ff; padding:10px 12px; border-radius:8px; }
+        .btn { color:#fff; font-weight:bold; transition:background-color .3s, border-color .3s; }
+        .btn-primary { background:#007bff; border-color:#007bff; }
+        .btn-primary:hover { background:#0056b3; border-color:#0056b3; }
+        .invite-codes { margin-top:20px; }
+        .invite-code { background:#2c2c2c; padding:10px; border-radius:5px; margin-bottom:5px; font-family:'Courier New', Courier, monospace; }
+        @media (max-width:768px){ .sidebar{width:60px;} .sidebar a{padding:15px 10px; text-align:center;} .sidebar a span{display:none;} .content{margin-left:60px;} }
+    </style>
+</head>
+<body>
+
+    <div class="sidebar">
+        <div class="navbar-brand">QRS</div>
+        <a href="{{ url_for('dashboard') }}" class="nav-link {% if active_page == 'dashboard' %}active{% endif %}">
+            <i class="fas fa-home"></i> <span>Dashboard</span>
+        </a>
+        {% if session.get('is_admin') %}
+        <a href="{{ url_for('settings') }}" class="nav-link {% if active_page == 'settings' %}active{% endif %}">
+            <i class="fas fa-cogs"></i> <span>Settings</span>
+        </a>
+        {% endif %}
+        <a href="{{ url_for('logout') }}" class="nav-link">
+            <i class="fas fa-sign-out-alt"></i> <span>Logout</span>
+        </a>
+    </div>
+
+    <div class="content">
+        <h2>Settings</h2>
+
+        <div class="status">
+            <strong>Current registration:</strong>
+            {% if registration_enabled %}
+                <span class="badge badge-ok">ENABLED</span>
+            {% else %}
+                <span class="badge badge-off">DISABLED</span>
+            {% endif %}
+            <small style="opacity:.8;">(from ENV: REGISTRATION_ENABLED={{ registration_env_value }})</small>
+        </div>
+
+        <div class="alert-info">
+            Registration is controlled via environment only. Set <code>REGISTRATION_ENABLED=true</code> or <code>false</code> and restart the app.
+        </div>
+
+        const reportContentElement = document.getElementById('reportMarkdown');
+        const reportContent = reportContentElement.innerText;
+        const routeDetails = `
+            Date: {{ report['timestamp'] }}.
+            Location: {{ report['latitude'] }}, {{ report['longitude'] }}.
+            Nearest City: {{ report['street_name'] }}.
+            Vehicle Type: {{ report['vehicle_type'] }}.
+            Destination: {{ report['destination'] }}.
+            Model Used: {{ report['model_used'] }}.
+        `;
+        const combinedText = preprocessText(reportContent + ' ' + routeDetails);
+        const sentences = splitIntoSentences(combinedText);
+
+        initializeProgressBar(sentences.length);
+        updateSpeechStatus('in progress');
+        synth.cancel();
+        utterances = [];
+        currentUtteranceIndex = 0;
+        isSpeaking = true;
+
+        sentences.forEach((sentence) => {
+            const utterance = new SpeechSynthesisUtterance(sentence.trim());
+            adjustSpeechParameters(utterance, sentence);
+            utterance.volume = 1;
+            utterance.voice = selectedVoice;
+
+            utterance.onend = () => {
+                updateProgressBar();
+                currentUtteranceIndex++;
+                if (currentUtteranceIndex < utterances.length) {
+                    synth.speak(utterances[currentUtteranceIndex]);
+                } else {
+                    isSpeaking = false;
+                    updateSpeechStatus('not active');
+                }
+            };
+            utterance.onerror = (event) => {
+                console.error('SpeechSynthesisUtterance.onerror', event);
+                alert("Speech has stopped");
+                isSpeaking = false;
+                updateSpeechStatus('not active');
+            };
+            utterances.push(utterance);
+        });
+
+        if (utterances.length > 0) {
+            synth.speak(utterances[0]);
+        }
+    }
+
+    function stopSpeech() {
+        if (synth.speaking) {
+            synth.cancel();
+        }
+        utterances = [];
+        currentUtteranceIndex = 0;
+        isSpeaking = false;
+        updateSpeechStatus('not active');
+    }
+
+    document.addEventListener('keydown', function(event) {
+        if (event.ctrlKey && event.altKey && event.key.toLowerCase() === 'r') {
+            readAloud();
+        }
+        if (event.ctrlKey && event.altKey && event.key.toLowerCase() === 's') {
+            stopSpeech();
+        }
+    });
+
+    window.addEventListener('touchstart', () => {
+        if (!voicesLoaded) {
+            preloadVoices().catch(e => console.error(e));
+        }
+    }, { once: true });
+</script>
 </body>
 </html>
     """,
@@ -13044,6 +14431,16 @@ async def api_scan():
             _cdb.commit()
             return jsonify(cached), 200
 
+    result, cpu_usage, ram_usage, quantum_results, street_name, model_used = await scan_debris_for_route(
+        lat_float, lon_float, vehicle_type, destination, user_id, selected_model=model_selection
+    )
+    harm_level = calculate_harm_level(result)
+    report_id = save_hazard_report(
+        lat_float, lon_float, street_name,
+        vehicle_type, destination, result,
+        cpu_usage, ram_usage, quantum_results,
+        user_id, harm_level, model_used
+    )
 
     combined_input = f"Vehicle Type: {vehicle_type}\nDestination: {destination}"
     is_allowed, analysis = await phf_filter_input(combined_input)
