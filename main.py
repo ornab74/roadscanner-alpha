@@ -2509,18 +2509,18 @@ class MultiKeySessionInterface(SecureCookieSessionInterface):
                                       signer_kwargs=signer_kwargs)
 
     def open_session(self, app, request):
-        cookie_name = self.get_cookie_name(app)  
-        s = request.cookies.get(cookie_name)
-        if not s:
+        cookie_name = self.get_cookie_name(app)
+        cookie_value = request.cookies.get(cookie_name)
+        if not cookie_value:
             return self.session_class()
 
         max_age = int(app.permanent_session_lifetime.total_seconds())
         for key in get_session_signing_keys(app):
-            ser = self._make_serializer(key)
-            if not ser:
+            serializer = self._make_serializer(key)
+            if not serializer:
                 continue
             try:
-                data = ser.loads(s, max_age=max_age)
+                data = serializer.loads(cookie_value, max_age=max_age)
                 return self.session_class(data)
             except (BadTimeSignature, BadSignature, Exception):
                 continue
