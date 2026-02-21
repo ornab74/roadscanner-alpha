@@ -18,7 +18,7 @@ from cryptography.hazmat.backends import default_backend
 from argon2 import PasswordHasher
 from argon2.exceptions import VerifyMismatchError
 from argon2.low_level import Type
-from datetime import timedelta, datetime
+from datetime import timedelta, datetime, timezone
 from markdown2 import markdown
 import bleach
 import geonamescache
@@ -256,6 +256,9 @@ def _enforce_origin_checks():
     # Exempt programmatic/API endpoints and webhooks where Origin is absent
     if path.startswith("/api/v1/") or path.startswith("/stripe/webhook") or path.startswith("/csp-report"):
         return None
+    if path in ("/login", "/register", "/forgot_password", "/reset_password"):
+        # Flask-WTF CSRF already protects these forms; some mobile browsers omit Origin.
+        return None
     if request.headers.get("X-API-Key-Id"):
         return None
 
@@ -284,7 +287,8 @@ def _enforce_origin_checks():
         if referer and not _matches(referer):
             return api_error("referer_mismatch", "Referer mismatch.", status=403)
         if not referer:
-            return api_error("origin_missing", "Missing Origin/Referer.", status=403)
+            # Privacy-focused browsers may omit both headers for same-origin form posts.
+            return None
 
     return None
 
@@ -764,8 +768,10 @@ def _google_oauth_enabled() -> bool:
 def _google_oauth_configured() -> bool:
     return bool(os.getenv("GOOGLE_CLIENT_ID") and os.getenv("GOOGLE_CLIENT_SECRET"))
 
-def _google_auth_available(registration_enabled: bool) -> bool:
-    return registration_enabled and _google_oauth_enabled() and _google_oauth_configured()
+def _google_auth_available(registration_enabled: bool | None = None) -> bool:
+    # Login with Google should be available even if classic registration is disabled.
+    # registration_enabled arg kept for backward compatibility at call sites.
+    return _google_oauth_enabled() and _google_oauth_configured()
 
 def _google_redirect_uri() -> str:
     configured = os.getenv("GOOGLE_OAUTH_REDIRECT_URI", "").strip()
@@ -796,6 +802,10 @@ def _username_for_google_identity(cursor: sqlite3.Cursor, email: str, sub: str) 
         suffix_str = f"-{suffix}"
         candidate = f"{base[:USERNAME_MAX_LENGTH - len(suffix_str)]}{suffix_str}"
 
+def _google_auto_register_enabled() -> bool:
+    return str(os.getenv("GOOGLE_AUTO_REGISTER", "true")).lower() in ("1", "true", "yes", "on")
+
+
 def authenticate_google_user(google_sub: str, email: str) -> tuple[bool, str]:
     if not google_sub or not email:
         return False, "Google identity is incomplete."
@@ -812,7 +822,7 @@ def authenticate_google_user(google_sub: str, email: str) -> tuple[bool, str]:
             session["is_admin"] = bool(is_admin)
             return True, "Logged in with Google."
 
-        if not registration_enabled:
+        if not (registration_enabled or _google_auto_register_enabled()):
             return False, "Registration is currently disabled."
 
         username = _username_for_google_identity(cursor, email=email, sub=google_sub)
@@ -10394,6 +10404,20 @@ def login():
         }
         a { text-decoration: none; }
         a:hover { text-decoration: underline; color: #66ff66; }
+        .btn-google-rainbow {
+            background:#fff;
+            border:1px solid rgba(255,255,255,.9);
+            font-weight:900;
+            letter-spacing:.3px;
+            color: transparent !important;
+            background-image: linear-gradient(90deg, #ff004d, #ff7a00, #ffd400, #18ff5a, #00d4ff, #7a5cff, #ff00c8);
+            -webkit-background-clip: text;
+            background-clip: text;
+        }
+        .btn-google-rainbow:hover {
+            filter: brightness(1.08) saturate(1.15);
+            text-decoration:none;
+        }
         @media (max-width: 768px) {
             .container { margin-top: 50px; }
             .brand { font-size: 2rem; }
@@ -10424,6 +10448,13 @@ def login():
             {% if error_message %}
             <p class="error-message text-center">{{ error_message }}</p>
             {% endif %}
+            {% with messages = get_flashed_messages(with_categories=true) %}
+              {% if messages %}
+                {% for cat,msg in messages %}
+                  <div class="alert alert-{{cat}}">{{msg}}</div>
+                {% endfor %}
+              {% endif %}
+            {% endwith %}
             <form method="POST" novalidate>
                 {{ form.hidden_tag() }}
                 <div class="form-group">
@@ -10437,7 +10468,7 @@ def login():
                 {{ form.submit(class="btn btn-primary btn-block") }}
             </form>
             {% if google_auth_available %}
-            <a class="btn btn-light btn-block mt-3" href="{{ url_for('google_start') }}">Continue with Google</a>
+            <a class="btn btn-light btn-block mt-3 btn-google-rainbow" href="{{ url_for('google_start') }}">Continue with Google</a>
             {% endif %}
             <p class="mt-3 text-center">Don't have an account? <a href="{{ url_for('register') }}">Register here</a></p>
         </div>
@@ -10479,6 +10510,7 @@ def register():
     if form.validate_on_submit():
         username = form.username.data
         password = form.password.data
+        email = form.email.data
         invite_code = form.invite_code.data if not registration_enabled else None
 
         if _captcha_enabled() and not _captcha_ok():
@@ -10549,6 +10581,20 @@ def register():
         }
         a { text-decoration: none; }
         a:hover { text-decoration: underline; color: #66ff66; }
+        .btn-google-rainbow {
+            background:#fff;
+            border:1px solid rgba(255,255,255,.9);
+            font-weight:900;
+            letter-spacing:.3px;
+            color: transparent !important;
+            background-image: linear-gradient(90deg, #ff004d, #ff7a00, #ffd400, #18ff5a, #00d4ff, #7a5cff, #ff00c8);
+            -webkit-background-clip: text;
+            background-clip: text;
+        }
+        .btn-google-rainbow:hover {
+            filter: brightness(1.08) saturate(1.15);
+            text-decoration:none;
+        }
         @media (max-width: 768px) {
             .container { margin-top: 50px; }
             .brand { font-size: 2rem; }
@@ -10579,11 +10625,22 @@ def register():
             {% if error_message %}
             <p class="error-message text-center">{{ error_message }}</p>
             {% endif %}
+            {% with messages = get_flashed_messages(with_categories=true) %}
+              {% if messages %}
+                {% for cat,msg in messages %}
+                  <div class="alert alert-{{cat}}">{{msg}}</div>
+                {% endfor %}
+              {% endif %}
+            {% endwith %}
             <form method="POST" novalidate>
                 {{ form.hidden_tag() }}
                 <div class="form-group">
                     {{ form.username.label }}
                     {{ form.username(class="form-control", placeholder="Choose a username") }}
+                </div>
+                <div class="form-group">
+                    {{ form.email.label }}
+                    {{ form.email(class="form-control", placeholder="you@example.com") }}
                 </div>
                 <div class="form-group">
                     {{ form.password.label }}
@@ -10598,6 +10655,9 @@ def register():
                 {% endif %}
                 {{ form.submit(class="btn btn-primary btn-block") }}
             </form>
+            {% if google_auth_available %}
+            <a class="btn btn-light btn-block mt-3 btn-google-rainbow" href="{{ url_for('google_start') }}">Register with Google</a>
+            {% endif %}
             <p class="mt-3 text-center">Already have an account? <a href="{{ url_for('login') }}">Login here</a></p>
         </div>
     </div>
