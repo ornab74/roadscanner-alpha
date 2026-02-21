@@ -2469,6 +2469,8 @@ def get_session_signing_keys(app) -> list[bytes]:
         keys.append(_hmac_derive(base_b, b"flask-session-signing-v1", window=(w - i), out_len=32))
     return keys
 
+    w = int(time.time() // SESSION_KEY_ROTATION_PERIOD_SECONDS)
+    n = max(1, SESSION_KEY_ROTATION_LOOKBACK)
 
 def get_csrf_signing_key(app) -> bytes:
     base = getattr(app, "secret_key", None) or app.config.get("SECRET_KEY")
@@ -2705,10 +2707,14 @@ HYBRID_ALG_ID    = "HY1"
 WRAP_INFO        = b"QRS|hybrid-wrap|v1"
 DATA_INFO        = b"QRS|data-aesgcm|v1"
 
+def get_feature_flag(db: sqlite3.Connection, key: str, default: str = "false") -> str:
+    row = db.execute("SELECT value FROM config WHERE key = ?", (key,)).fetchone()
+    return (row[0] if row and row[0] is not None else default)
 
 COMPRESS_MIN   = int(os.getenv("QRS_COMPRESS_MIN", "512"))    
 ENV_CAP_BYTES  = int(os.getenv("QRS_ENV_CAP_BYTES", "131072"))  
 
+EXPIRATION_HOURS = 65
 
 POLICY = {
     "min_env_version": "QRS2",
@@ -2941,6 +2947,13 @@ def _gf256_inv(a: int) -> int:
         raise ZeroDivisionError
     return _gf256_pow(a, 254)
 
+            # Convert to perceptual coordinates
+            h, s, l = self._rgb_to_hsl(j)
+            L, C, H = _approx_oklch_from_rgb(
+                (j >> 16 & 0xFF) / 255.0,
+                (j >> 8 & 0xFF) / 255.0,
+                (j & 0xFF) / 255.0,
+            )
 
 def shamir_recover(shares: list[tuple[int, bytes]], t: int) -> bytes:
     if len(shares) < t:
@@ -4287,24 +4300,8 @@ def create_tables():
             )
         """)
 
-      
-        cursor.execute("PRAGMA table_info(blog_posts)")
-        blog_cols = {row[1] for row in cursor.fetchall()}
-        blog_alters = {
-            
-            "summary_enc": "ALTER TABLE blog_posts ADD COLUMN summary_enc TEXT",
-            "tags_enc": "ALTER TABLE blog_posts ADD COLUMN tags_enc TEXT",
-            
-            "sig_alg": "ALTER TABLE blog_posts ADD COLUMN sig_alg TEXT",
-            "sig_pub_fp8": "ALTER TABLE blog_posts ADD COLUMN sig_pub_fp8 TEXT",
-            "sig_val": "ALTER TABLE blog_posts ADD COLUMN sig_val BLOB",
-            
-            "featured": "ALTER TABLE blog_posts ADD COLUMN featured INTEGER NOT NULL DEFAULT 0",
-            "featured_rank": "ALTER TABLE blog_posts ADD COLUMN featured_rank INTEGER NOT NULL DEFAULT 0",
-        }
-        for col, alter_sql in blog_alters.items():
-            if col not in blog_cols:
-                cursor.execute(alter_sql)
+    
+    self._x25519_priv_enc = x_privenc or b""
 
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_blog_status_created ON blog_posts (status, created_at DESC)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_blog_updated ON blog_posts (updated_at DESC)")
@@ -4363,108 +4360,50 @@ def create_tables():
         db.commit()
     print("Database tables created and verified successfully.")
 
-class BlogForm(FlaskForm):
-    title = StringField('Title', validators=[DataRequired(), Length(min=1, max=160)])
-    slug = StringField('Slug', validators=[Length(min=3, max=80)])
-    summary = TextAreaField('Summary', validators=[Length(max=5000)])
-    content = TextAreaField('Content', validators=[DataRequired(), Length(min=1, max=200000)])
-    tags = StringField('Tags', validators=[Length(max=500)])
-    status = SelectField('Status', choices=[('draft', 'Draft'), ('published', 'Published'), ('archived', 'Archived')], validators=[DataRequired()])
-    submit = SubmitField('Save')
+    pq_pub_b   = _b64get(ENV_PQ_PUB_B64, required=False)
+    pq_privenc = _b64get(ENV_PQ_PRIV_ENC_B64, required=False)
 
-_SLUG_RE = re.compile(r'^[a-z0-9]+(?:-[a-z0-9]+)*$')
-
-def _slugify(title: str) -> str:
-    base = re.sub(r'[^a-zA-Z0-9\s-]', '', (title or '')).strip().lower()
-    base = re.sub(r'\s+', '-', base)
-    base = re.sub(r'-{2,}', '-', base).strip('-')
-    if not base:
-        base = secrets.token_hex(4)
-    return base[:80]
     
-def _valid_slug(slug: str) -> bool:
-    return bool(_SLUG_RE.fullmatch(slug or ''))
+    self.pq_pub       = pq_pub_b or None
+    self._pq_priv_enc = pq_privenc or None
+
     
-_ALLOWED_TAGS = set(bleach.sanitizer.ALLOWED_TAGS) | {
-    'p','h1','h2','h3','h4','h5','h6','ul','ol','li','strong','em','blockquote','code','pre',
-    'a','img','hr','br','table','thead','tbody','tr','th','td','span'
-}
-_ALLOWED_ATTRS = {
-    **bleach.sanitizer.ALLOWED_ATTRIBUTES,
-    'a': ['href','title','rel','target'],
-    'img': ['src','alt','title','width','height','loading','decoding'],
-    'span': ['class','data-emoji'],
-    'code': ['class'],
-    'pre': ['class'],
-    'th': ['colspan','rowspan'],
-    'td': ['colspan','rowspan']
-}
-_ALLOWED_PROTOCOLS = ['http','https','mailto','data']
+    if STRICT_PQ2_ONLY:
+        have_priv = bool(pq_privenc) or bool(cache and cache.get("pq_priv_raw"))
+        if not (self._pq_alg_name and self.pq_pub and have_priv):
+            raise RuntimeError("Strict PQ2 mode: ML-KEM keys not fully available (need alg+pub+priv).")
 
-def _link_cb_rel_and_target(attrs, new):
-    if (None, 'href') not in attrs:
-        return attrs
-    rel_key = (None, 'rel')
-    rel_tokens = set((attrs.get(rel_key, '') or '').split())
-    rel_tokens.update({'nofollow', 'noopener', 'noreferrer'})
-    attrs[rel_key] = ' '.join(sorted(t for t in rel_tokens if t))
-    attrs[(None, 'target')] = '_blank'
-    return attrs
-
-def sanitize_html(html: str) -> str:
-    html = html or ""
-    html = bleach.clean(
-        html,
-        tags=_ALLOWED_TAGS,
-        attributes=_ALLOWED_ATTRS,
-        protocols=_ALLOWED_PROTOCOLS,
-        strip=True,
+    
+    logger.debug(
+        "Hybrid keys loaded: x25519_pub=%s, pq_alg=%s, pq_pub=%s, pq_priv=%s (sealed=%s)",
+        "yes" if self.x25519_pub else "no",
+        self._pq_alg_name or "none",
+        "yes" if self.pq_pub else "no",
+        "yes" if (pq_privenc or (cache and cache.get('pq_priv_raw'))) else "no",
+        "yes" if cache else "no",
     )
-    html = bleach.linkify(
-        html,
-        callbacks=[_link_cb_rel_and_target],
-        skip_tags=['code','pre'],
-    )
-    return html
 
-def sanitize_text(s: str, max_len: int) -> str:
-    s = bleach.clean(s or "", tags=[], attributes={}, protocols=_ALLOWED_PROTOCOLS, strip=True, strip_comments=True)
-    s = re.sub(r'\s+', ' ', s).strip()
-    return s[:max_len]
+def _km_decrypt_x25519_priv(self: "KeyManager") -> x25519.X25519PrivateKey:
+    cache = getattr(self, "_sealed_cache", None)
+    if cache is not None and "x25519_priv_raw" in cache:
+        raw = cache["x25519_priv_raw"]
+        return x25519.X25519PrivateKey.from_private_bytes(raw)
+
+    x_enc = cast(bytes, getattr(self, "_x25519_priv_enc"))
+    passphrase = os.getenv(self.passphrase_env_var) or ""
+    salt = _b64get(ENV_SALT_B64, required=True)
+    kek = hash_secret_raw(passphrase.encode(), salt, 3, 512*1024, max(2, (os.cpu_count() or 2)//2), 32, ArgonType.ID)
+    aes = AESGCM(kek)
+    n, ct = x_enc[:12], x_enc[12:]
+    raw = aes.decrypt(n, ct, b"x25519")
+    return x25519.X25519PrivateKey.from_private_bytes(raw)
+
+def _km_decrypt_pq_priv(self: "KeyManager") -> Optional[bytes]:
     
-def sanitize_tags_csv(raw: str, max_tags: int = 50) -> str:
-    parts = [sanitize_text(p, 40) for p in (raw or "").split(",")]
-    parts = [p for p in parts if p]
-    out = ",".join(parts[:max_tags])
-    return out[:500]
-    
-def _blog_ctx(field: str, rid: Optional[int] = None) -> dict:
-    return build_hd_ctx(domain="blog", field=field, rid=rid)
-    
-def blog_encrypt(field: str, plaintext: str, rid: Optional[int] = None) -> str:
-    return encrypt_data(plaintext or "", ctx=_blog_ctx(field, rid))
-    
-def blog_decrypt(ciphertext: Optional[str]) -> str:
-    if not ciphertext: return ""
-    return decrypt_data(ciphertext) or ""
-    
-def _post_sig_payload(slug: str, title_html: str, content_html: str, summary_html: str, tags_csv: str, status: str, created_at: str, updated_at: str) -> bytes:
-    return _canon_json({
-        "v":"blog1",
-        "slug": slug,
-        "title_html": title_html,
-        "content_html": content_html,
-        "summary_html": summary_html,
-        "tags_csv": tags_csv,
-        "status": status,
-        "created_at": created_at,
-        "updated_at": updated_at
-    })
-def _sign_post(payload: bytes) -> tuple[str, str, bytes]:
-    alg = key_manager.sig_alg_name or "Ed25519"
-    sig = key_manager.sign_blob(payload)
-    pub = getattr(key_manager, "sig_pub", None) or b""
-    return alg, _fp8(pub), sig
+    cache = getattr(self, "_sealed_cache", None)
+    if cache is not None and cache.get("pq_priv_raw") is not None:
+        return cache.get("pq_priv_raw")
+
     
 def _verify_post(payload: bytes, sig_alg: str, sig_pub_fp8: str, sig_val: bytes) -> bool:
     # Pass 12: verify using a persisted signing public key keyed by fp8 to survive key rotations/restarts.
@@ -4770,6 +4709,2337 @@ def blog_list_published(limit: int = 25, offset: int = 0) -> list[dict]:
         })
     return out
 
+
+def _km_decrypt_sig_priv(self: "KeyManager") -> bytes:
+   
+    with db_connect(DB_FILE) as db:
+        cur = db.cursor()
+        cur.execute(
+            """
+            SELECT id,slug,title_enc,summary_enc,tags_enc,status,created_at,updated_at,author_id,featured,featured_rank
+            FROM blog_posts
+            WHERE status='published' AND featured=1
+            ORDER BY featured_rank DESC, created_at DESC
+            LIMIT ?
+            """,
+            (int(limit),),
+        )
+        rows = cur.fetchall()
+    out: list[dict] = []
+    for r in rows:
+        out.append(
+            {
+                "id": r[0],
+                "slug": r[1],
+                "title": blog_decrypt(r[2]),
+                "summary": blog_decrypt(r[3]),
+                "tags": blog_decrypt(r[4]),
+                "status": r[5],
+                "created_at": r[6],
+                "updated_at": r[7],
+                "author_id": r[8],
+                "featured": int(r[9] or 0),
+                "featured_rank": int(r[10] or 0),
+            }
+        )
+    return out
+
+    sig_enc = getattr(self, "_sig_priv_enc", None)
+    if not sig_enc:
+        raise RuntimeError("Signature private key not available in env.")
+
+    passphrase = os.getenv(self.passphrase_env_var) or ""
+    if not passphrase:
+        raise RuntimeError(f"{self.passphrase_env_var} not set")
+
+def blog_set_featured(post_id: int, featured: bool, featured_rank: int = 0) -> bool:
+    try:
+        with db_connect(DB_FILE) as db:
+            cur = db.cursor()
+            cur.execute(
+                "UPDATE blog_posts SET featured=?, featured_rank=? WHERE id=?",
+                (1 if featured else 0, int(featured_rank or 0), int(post_id)),
+            )
+            db.commit()
+        audit.append(
+            "blog_featured_set",
+            {"id": int(post_id), "featured": bool(featured), "featured_rank": int(featured_rank or 0)},
+            actor=session.get("username") or "admin",
+        )
+        return True
+    except Exception as e:
+        logger.error(f"blog_set_featured failed: {e}", exc_info=True)
+        return False
+        
+def blog_list_all_admin(limit: int = 200, offset: int = 0) -> list[dict]:
+    with db_connect(DB_FILE) as db:
+        cur = db.cursor()
+        cur.execute("""
+            SELECT id,slug,title_enc,status,created_at,updated_at,featured,featured_rank
+            FROM blog_posts
+            ORDER BY updated_at DESC
+            LIMIT ? OFFSET ?
+        """, (int(limit), int(offset)))
+        rows = cur.fetchall()
+    out=[]
+    for r in rows:
+        out.append({
+            "id": r[0], "slug": r[1],
+            "title": blog_decrypt(r[2]),
+            "status": r[3],
+            "created_at": r[4],
+            "updated_at": r[5],
+            "featured": int(r[6] or 0),
+            "featured_rank": int(r[7] or 0),
+        })
+    return out
+    
+def blog_slug_exists(slug: str, exclude_id: Optional[int]=None) -> bool:
+    with db_connect(DB_FILE) as db:
+        cur = db.cursor()
+        if exclude_id:
+            cur.execute("SELECT 1 FROM blog_posts WHERE slug=? AND id != ? LIMIT 1", (slug, int(exclude_id)))
+        else:
+            cur.execute("SELECT 1 FROM blog_posts WHERE slug=? LIMIT 1", (slug,))
+        return cur.fetchone() is not None
+        
+def blog_save(
+    post_id: Optional[int],
+    author_id: int,
+    title_html: str,
+    content_html: str,
+    summary_html: str,
+    tags_csv: str,
+    status: str,
+    slug_in: Optional[str],
+) -> tuple[bool, str, Optional[int], Optional[str]]:
+    status = (status or "draft").strip().lower()
+    if status not in ("draft", "published", "archived"):
+        return False, "Invalid status", None, None
+
+    n, ct = sig_enc[:12], sig_enc[12:]
+    label = b"pqsig" if (self.sig_alg_name or "").startswith(("ML-DSA", "Dilithium")) else b"ed25519"
+    return aes.decrypt(n, ct, label)
+
+def _oqs_sig_name() -> Optional[str]:
+    if oqs is None:
+        return None
+    oqs_mod = cast(Any, oqs)
+    for name in ("ML-DSA-87","ML-DSA-65","Dilithium5","Dilithium3"):
+        try:
+            oqs_mod.Signature(name)
+            return name
+        except Exception:
+            continue
+    return None
+
+
+def _km_load_or_create_signing(self: "KeyManager") -> None:
+    
+    cache = getattr(self, "_sealed_cache", None)
+
+    alg = os.getenv(ENV_SIG_ALG) or None
+    pub = _b64get(ENV_SIG_PUB_B64, required=False)
+    enc = _b64get(ENV_SIG_PRIV_ENC_B64, required=False)
+
+    have_priv = bool(enc) or bool(cache is not None and cache.get("sig_priv_raw") is not None)
+
+    
+    if not (alg and pub and have_priv):
+        if cache is not None and cache.get("sig_priv_raw") is not None:
+            alg_cache = (cache.get("sig_alg") or alg or "Ed25519")
+            pub_cache = cache.get("sig_pub_raw")
+
+    try:
+        with db_connect(DB_FILE) as db:
+            cur = db.cursor()
+            if post_id:
+                cur.execute("SELECT created_at FROM blog_posts WHERE id=? LIMIT 1", (int(post_id),))
+                row = cur.fetchone()
+                if row:
+                    created_at = row[0]
+                    existing = True
+                else:
+                    existing = False
+
+    
+    if not (alg and pub and have_priv):
+        passphrase = os.getenv(self.passphrase_env_var) or ""
+        if not passphrase:
+            raise RuntimeError(f"{self.passphrase_env_var} not set")
+
+        salt = _b64get(ENV_SALT_B64, required=True)
+        kek = hash_secret_raw(
+            passphrase.encode(), salt,
+            3, 512 * 1024, max(2, (os.cpu_count() or 2)//2),
+            32, ArgonType.ID
+        )
+        aes = AESGCM(kek)
+
+        try_pq = _oqs_sig_name() if oqs is not None else None
+        if try_pq:
+            with oqs.Signature(try_pq) as s:  # type: ignore[attr-defined]
+                pub_raw = s.generate_keypair()
+                sk_raw  = s.export_secret_key()
+            n = secrets.token_bytes(12)
+            enc_raw = n + aes.encrypt(n, sk_raw, b"pqsig")
+            os.environ[ENV_SIG_ALG] = try_pq
+            _b64set(ENV_SIG_PUB_B64, pub_raw)
+            _b64set(ENV_SIG_PRIV_ENC_B64, enc_raw)
+            alg, pub, enc = try_pq, pub_raw, enc_raw
+            logger.debug("Generated PQ signature keypair (%s) into ENV.", try_pq)
+        else:
+            if STRICT_PQ2_ONLY:
+                raise RuntimeError("Strict PQ2 mode: ML-DSA signature required, but oqs unavailable.")
+            # Ed25519 fallback
+            kp  = ed25519.Ed25519PrivateKey.generate()
+            pub_raw = kp.public_key().public_bytes(
+                serialization.Encoding.Raw, serialization.PublicFormat.Raw
+            )
+            sk_raw  = kp.private_bytes(
+                serialization.Encoding.Raw, serialization.PrivateFormat.Raw,
+                serialization.NoEncryption()
+            )
+            n = secrets.token_bytes(12)
+            enc_raw = n + aes.encrypt(n, sk_raw, b"ed25519")
+            os.environ[ENV_SIG_ALG] = "Ed25519"
+            _b64set(ENV_SIG_PUB_B64, pub_raw)
+            _b64set(ENV_SIG_PRIV_ENC_B64, enc_raw)
+            alg, pub, enc = "Ed25519", pub_raw, enc_raw
+            logger.debug("Generated Ed25519 signature keypair into ENV (fallback).")
+
+    self.sig_alg_name = alg
+    self.sig_pub = pub
+    self._sig_priv_enc = enc or b""
+
+    if STRICT_PQ2_ONLY and not (self.sig_alg_name or "").startswith(("ML-DSA", "Dilithium")):
+        raise RuntimeError("Strict PQ2 mode: ML-DSA (Dilithium) signature required in env.")
+
+
+def _km_sign(self, data: bytes) -> bytes:
+    if (getattr(self, "sig_alg_name", "") or "").startswith("ML-DSA"):
+        if oqs is None:
+            raise RuntimeError("PQ signature requested but oqs is unavailable")
+        oqs_mod = cast(Any, oqs)
+        with oqs_mod.Signature(self.sig_alg_name, _km_decrypt_sig_priv(self)) as sig:
+            return sig.sign(data)
+    else:
+        return ed25519.Ed25519PrivateKey.from_private_bytes(
+            _km_decrypt_sig_priv(self)
+        ).sign(data)
+
+def _km_verify(self, pub: bytes, sig_bytes: bytes, data: bytes) -> bool:
+    try:
+        with db_connect(DB_FILE) as db:
+            cur = db.cursor()
+            cur.execute("DELETE FROM blog_posts WHERE id=?", (int(post_id),))
+            db.commit()
+        audit.append("blog_delete", {"id": int(post_id)}, actor=session.get("username") or "admin")
+        return True
+    except Exception as e:
+        logger.error(f"blog_delete failed: {e}", exc_info=True)
+        return False
+
+
+_KM = cast(Any, KeyManager)
+_KM._oqs_kem_name               = _km_oqs_kem_name
+_KM._load_or_create_hybrid_keys = _km_load_or_create_hybrid_keys
+_KM._decrypt_x25519_priv        = _km_decrypt_x25519_priv
+_KM._decrypt_pq_priv            = _km_decrypt_pq_priv
+_KM._load_or_create_signing     = _km_load_or_create_signing
+_KM._decrypt_sig_priv           = _km_decrypt_sig_priv 
+_KM.sign_blob                   = _km_sign
+_KM.verify_blob                 = _km_verify
+
+
+HD_FILE = Path("./sealed_store/hd_epoch.json")
+
+
+def hd_get_epoch() -> int:
+    try:
+        with db_connect(DB_FILE) as db:
+            cur = db.cursor()
+            cur.execute(
+                "SELECT id,slug,title_enc,content_enc,summary_enc,tags_enc,status,created_at,updated_at,author_id,featured,featured_rank "
+                "FROM blog_posts WHERE id=? LIMIT 1",
+                (int(post_id),),
+            )
+            r = cur.fetchone()
+        if not r:
+            return None
+        return {
+            "id": r[0],
+            "slug": r[1],
+            "title": blog_decrypt(r[2]),
+            "content": blog_decrypt(r[3]),
+            "summary": blog_decrypt(r[4]),
+            "tags": blog_decrypt(r[5]),
+            "status": r[6],
+            "created_at": r[7],
+            "updated_at": r[8],
+            "author_id": r[9],
+            "featured": int(r[10] or 0),
+            "featured_rank": int(r[11] or 0),
+        }
+    except Exception:
+        pass
+    return 1
+
+
+def hd_rotate_epoch() -> int:
+    ep = hd_get_epoch() + 1
+    HD_FILE.parent.mkdir(parents=True, exist_ok=True)
+    HD_FILE.write_text(json.dumps({"epoch": ep, "rotated_at": int(time.time())}))
+    HD_FILE.chmod(0o600)
+    try:
+        colorsync.bump_epoch()
+    except Exception:
+        pass
+    return ep
+
+
+def _rootk() -> bytes:
+    return hkdf_sha3(encryption_key, info=b"QRS|rootk|v1", length=32)
+
+
+def derive_domain_key(domain: str, field: str, epoch: int) -> bytes:
+    info = f"QRS|dom|{domain}|{field}|epoch={epoch}".encode()
+    return hkdf_sha3(_rootk(), info=info, length=32)
+
+
+def build_hd_ctx(domain: str, field: str, rid: int | None = None) -> dict:
+    return {
+        "domain": domain,
+        "field": field,
+        "epoch": hd_get_epoch(),
+        "rid": int(rid or 0),
+    }
+
+
+class DecryptionGuard:
+    def __init__(self, capacity: int = 40, refill_per_min: int = 20) -> None:
+        self.capacity = capacity
+        self.tokens = capacity
+        self.refill_per_min = refill_per_min
+        self.last = time.time()
+        self.lock = threading.Lock()
+
+    def _refill(self) -> None:
+        now = time.time()
+        add = (self.refill_per_min / 60.0) * (now - self.last)
+        if add > 0:
+            self.tokens = min(self.capacity, self.tokens + add)
+            self.last = now
+
+    def register_failure(self) -> bool:
+        with self.lock:
+            self._refill()
+            if self.tokens >= 1:
+                self.tokens -= 1
+                time.sleep(random.uniform(0.05, 0.25))
+                return True
+            return False
+
+dec_guard = DecryptionGuard()
+AUDIT_FILE = Path("./sealed_store/audit.log")
+
+class AuditTrail:
+    def __init__(self, km: "KeyManager"):
+        self.km = km
+        AUDIT_FILE.parent.mkdir(parents=True, exist_ok=True)
+
+    def _key(self) -> bytes:
+        passphrase = os.getenv(self.km.passphrase_env_var) or ""
+        salt = _b64get(ENV_SALT_B64, required=True)
+        base_kek = hash_secret_raw(
+            passphrase.encode(),
+            salt,
+            time_cost=3,
+            memory_cost=512 * 1024,
+            parallelism=max(2, (os.cpu_count() or 2) // 2),
+            hash_len=32,
+            type=ArgonType.ID,
+        )
+
+        sealed_store = getattr(self.km, "sealed_store", None)
+        if isinstance(sealed_store, SealedStore):
+            split_kek = sealed_store._derive_split_kek(base_kek)
+        else:
+            split_kek = hkdf_sha3(base_kek, info=b"QRS|split-kek|v1", length=32)
+
+        return hkdf_sha3(split_kek, info=b"QRS|audit|v1", length=32)
+    def _last_hash(self) -> str:
+        try:
+            with AUDIT_FILE.open("rb") as f:
+                f.seek(0, os.SEEK_END)
+                size = f.tell()
+                if size == 0:
+                    return "GENESIS"
+                back = min(8192, size)
+                f.seek(size - back)
+                lines = f.read().splitlines()
+                if not lines:
+                    return "GENESIS"
+                return json.loads(lines[-1].decode()).get("h", "GENESIS")
+        except Exception:
+            return "GENESIS"
+
+    def append(self, event: str, data: dict, actor: str = "system"):
+        try:
+            ent = {
+                "ts": int(time.time()),
+                "actor": actor,
+                "event": event,
+                "data": data,
+                "prev": self._last_hash(),
+            }
+            j = json.dumps(ent, separators=(",", ":")).encode()
+            h = hashlib.sha3_256(j).hexdigest()
+            n = secrets.token_bytes(12)
+            ct = AESGCM(self._key()).encrypt(n, j, b"audit")
+            rec = json.dumps({"n": b64e(n), "ct": b64e(ct), "h": h}, separators=(",", ":")) + "\n"
+            with AUDIT_FILE.open("a", encoding="utf-8") as f:
+                f.write(rec)
+                AUDIT_FILE.chmod(0o600)
+        except Exception as e:
+            logger.error(f"audit append failed: {e}", exc_info=True)
+
+    def verify(self) -> dict:
+        ok = True
+        count = 0
+        prev = "GENESIS"
+        try:
+            key = self._key()
+            with AUDIT_FILE.open("rb") as f:
+                for line in f:
+                    if not line.strip():
+                        continue
+                    obj = json.loads(line.decode())
+                    pt = AESGCM(key).decrypt(b64d(obj["n"]), b64d(obj["ct"]), b"audit")
+                    if hashlib.sha3_256(pt).hexdigest() != obj["h"]:
+                        ok = False
+                        break
+                    ent = json.loads(pt.decode())
+                    if ent.get("prev") != prev:
+                        ok = False
+                        break
+                    prev = obj["h"]
+                    count += 1
+            return {"ok": ok, "entries": count, "tip": prev}
+        except Exception as e:
+            logger.error(f"audit verify failed: {e}", exc_info=True)
+            return {"ok": False, "entries": 0, "tip": ""}
+
+    def tail(self, limit: int = 20) -> list[dict]:
+        out: list[dict] = []
+        try:
+            key = self._key()
+            lines = AUDIT_FILE.read_text(encoding="utf-8").splitlines()
+            for line in lines[-max(1, min(100, limit)):]:
+                obj = json.loads(line)
+                pt = AESGCM(key).decrypt(b64d(obj["n"]), b64d(obj["ct"]), b"audit")
+                ent = json.loads(pt.decode())
+                out.append(
+                    {
+                        "ts": ent["ts"],
+                        "actor": ent["actor"],
+                        "event": ent["event"],
+                        "data": ent["data"],
+                    }
+                )
+        except Exception as e:
+            logger.error(f"audit tail failed: {e}", exc_info=True)
+        return out
+
+
+bootstrap_env_keys(
+    strict_pq2=STRICT_PQ2_ONLY,
+    echo_exports=bool(int(os.getenv("QRS_BOOTSTRAP_SHOW","0")))
+)
+
+
+key_manager = KeyManager()
+# Pass 12: persist signing public key by fp8 for blog verification across future key rotations.
+try:
+    _pub = getattr(key_manager, "sig_pub", None) or b""
+    if _pub:
+        with sqlite3.connect(KEYSTORE_DB_PATH, timeout=30) as _db:
+            _db.execute("CREATE TABLE IF NOT EXISTS config (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+            _cur = _db.cursor()
+            _cur.execute(
+                "INSERT INTO config (key,value) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                (f"sigpub:{_fp8(_pub)}", base64.b64encode(_pub).decode("utf-8")),
+            )
+            _db.commit()
+except Exception:
+    logger.exception("Failed to persist blog signing pubkey")
+
+encryption_key = key_manager.get_key()
+key_manager._sealed_cache = None
+key_manager.sealed_store = SealedStore(key_manager)
+
+
+if not key_manager.sealed_store.exists() and os.getenv("QRS_ENABLE_SEALED","1")=="1":
+    key_manager._load_or_create_hybrid_keys()
+    key_manager._load_or_create_signing()
+    key_manager.sealed_store.save_from_current_keys()
+if key_manager.sealed_store.exists():
+    key_manager.sealed_store.load_into_km()
+
+
+key_manager._load_or_create_hybrid_keys()
+key_manager._load_or_create_signing()
+
+audit = AuditTrail(key_manager)
+audit.append("boot", {"sealed_loaded": bool(getattr(key_manager, "_sealed_cache", None))})
+
+key_manager._sealed_cache = None
+key_manager.sealed_store = SealedStore(key_manager)
+if not key_manager.sealed_store.exists() and os.getenv("QRS_ENABLE_SEALED","1")=="1":
+    key_manager._load_or_create_hybrid_keys()
+    key_manager._load_or_create_signing()
+    key_manager.sealed_store.save_from_current_keys()
+if key_manager.sealed_store.exists():
+    key_manager.sealed_store.load_into_km()
+
+key_manager._load_or_create_hybrid_keys()
+key_manager._load_or_create_signing()
+
+audit = AuditTrail(key_manager)
+audit.append("boot", {"sealed_loaded": bool(getattr(key_manager, "_sealed_cache", None))})
+
+
+def encrypt_data(data: Any, ctx: Optional[Mapping[str, Any]] = None) -> Optional[str]:
+    try:
+        if data is None:
+            return None
+        if not isinstance(data, bytes):
+            data = str(data).encode()
+
+        comp_alg, pt_comp, orig_len = _compress_payload(data)
+        dek = secrets.token_bytes(32)
+        data_nonce = secrets.token_bytes(12)
+        data_ct = AESGCM(dek).encrypt(data_nonce, pt_comp, None)
+
+
+        if STRICT_PQ2_ONLY and not (key_manager._pq_alg_name and getattr(key_manager, "pq_pub", None)):
+            raise RuntimeError("Strict PQ2 mode requires ML-KEM; liboqs and PQ KEM keys must be present.")
+
+        x_pub: bytes = key_manager.x25519_pub
+        if not x_pub:
+            raise RuntimeError("x25519 public key not initialized (used alongside PQ KEM in hybrid wrap)")
+
+
+        eph_priv = x25519.X25519PrivateKey.generate()
+        eph_pub = eph_priv.public_key().public_bytes(
+            serialization.Encoding.Raw, serialization.PublicFormat.Raw
+        )
+        ss_x = eph_priv.exchange(x25519.X25519PublicKey.from_public_bytes(x_pub))
+
+
+        pq_ct: bytes = b""
+        ss_pq: bytes = b""
+        if key_manager._pq_alg_name and oqs is not None and getattr(key_manager, "pq_pub", None):
+            oqs_mod = cast(Any, oqs)
+            with oqs_mod.KeyEncapsulation(key_manager._pq_alg_name) as kem:
+                pq_ct, ss_pq = kem.encap_secret(cast(bytes, key_manager.pq_pub))
+        else:
+            if STRICT_PQ2_ONLY:
+                raise RuntimeError("Strict PQ2 mode: PQ KEM public key not available.")
+
+
+        col = colorsync.sample()
+        col_info = json.dumps(
+            {
+                "qid25": col["qid25"]["code"],
+                "hx": col["hex"],
+                "en": col["entropy_norm"],
+                "ep": col["epoch"],
+            },
+            separators=(",", ":"),
+        ).encode()
+
+
+        hd_ctx: Optional[dict[str, Any]] = None
+        dk: bytes = b""
+        if isinstance(ctx, Mapping) and ctx.get("domain"):
+            ep = int(ctx.get("epoch", hd_get_epoch()))
+            field = str(ctx.get("field", ""))
+            dk = derive_domain_key(str(ctx["domain"]), field, ep)
+            hd_ctx = {
+                "domain": str(ctx["domain"]),
+                "field": field,
+                "epoch": ep,
+                "rid": int(ctx.get("rid", 0)),
+            }
+
+
+        wrap_info = WRAP_INFO + b"|" + col_info + (b"|HD" if hd_ctx else b"")
+        wrap_key = hkdf_sha3(ss_x + ss_pq + dk, info=wrap_info, length=32)
+        wrap_nonce = secrets.token_bytes(12)
+        dek_wrapped = AESGCM(wrap_key).encrypt(wrap_nonce, dek, None)
+
+
+        env: dict[str, Any] = {
+            "v": "QRS2",
+            "alg": HYBRID_ALG_ID,
+            "pq_alg": key_manager._pq_alg_name or "",
+            "pq_ct": b64e(pq_ct),
+            "x_ephemeral_pub": b64e(eph_pub),
+            "wrap_nonce": b64e(wrap_nonce),
+            "dek_wrapped": b64e(dek_wrapped),
+            "data_nonce": b64e(data_nonce),
+            "data_ct": b64e(data_ct),
+            "comp": {"alg": comp_alg, "orig_len": orig_len},
+            "col_meta": {
+                "qid25": col["qid25"]["code"],
+                "qid25_hex": col["qid25"]["hex"],
+                "hex": col["hex"],
+                "oklch": col["oklch"],
+                "hsl": col["hsl"],
+                "entropy_norm": col["entropy_norm"],
+                "epoch": col["epoch"],
+            },
+        }
+        if hd_ctx:
+            env["hd_ctx"] = hd_ctx
+
+        core = {
+            "v": env["v"],
+            "alg": env["alg"],
+            "pq_alg": env["pq_alg"],
+            "pq_ct": env["pq_ct"],
+            "x_ephemeral_pub": env["x_ephemeral_pub"],
+            "wrap_nonce": env["wrap_nonce"],
+            "dek_wrapped": env["dek_wrapped"],
+            "data_nonce": env["data_nonce"],
+            "data_ct": env["data_ct"],
+            "comp": env["comp"],
+            "col_meta": env["col_meta"],
+            "policy": {
+                "min_env_version": POLICY["min_env_version"],
+                "require_sig_on_pq2": POLICY["require_sig_on_pq2"],
+                "require_pq_if_available": POLICY["require_pq_if_available"],
+            },
+            "hd_ctx": env.get("hd_ctx", {}),
+        }
+        sig_payload = _canon_json(core)
+
+
+        sig_alg_name: str = key_manager.sig_alg_name or ""
+        if STRICT_PQ2_ONLY and not (sig_alg_name.startswith("ML-DSA") or sig_alg_name.startswith("Dilithium")):
+            raise RuntimeError("Strict PQ2 mode requires ML-DSA (Dilithium) signatures.")
+        sig_raw = key_manager.sign_blob(sig_payload)
+
+        alg_id_short = SIG_ALG_IDS.get(sig_alg_name, ("Ed25519", "ED25"))[1]
+        sig_pub_b = cast(Optional[bytes], key_manager.sig_pub)
+        if sig_pub_b is None:
+            raise RuntimeError("Signature public key not available")
+
+        env["sig"] = {
+            "alg": sig_alg_name,
+            "alg_id": alg_id_short,
+            "pub": b64e(sig_pub_b),
+            "fp8": _fp8(sig_pub_b),
+            "val": b64e(sig_raw),
+        }
+
+        blob_json = json.dumps(env, separators=(",", ":")).encode()
+        if len(blob_json) > ENV_CAP_BYTES:
+            logger.error(f"Envelope too large ({len(blob_json)}B > {ENV_CAP_BYTES}B)")
+            return None
+
+        # -----------------------------
+        # Blog backup / restore (JSON) to survive container rebuilds
+        # -----------------------------
+
+    except Exception as e:
+        logger.error(f"PQ2 encrypt failed: {e}", exc_info=True)
+        return None
+
+def decrypt_data(encrypted_data_b64: str) -> Optional[str]:
+    try:
+
+def export_blog_posts_json() -> dict:
+    # Export plaintext fields + signature metadata; do not export encrypted blobs.
+    out: list[dict] = []
+    with db_connect(DB_FILE) as db:
+        cur = db.cursor()
+        cur.execute(
+            "SELECT id,slug,title_enc,content_enc,summary_enc,tags_enc,status,created_at,updated_at,author_id,sig_alg,sig_pub_fp8,sig_val "
+            "FROM blog_posts ORDER BY created_at ASC"
+        )
+        rows = cur.fetchall()
+
+            if bool(POLICY.get("require_sig_on_pq2", False)) and "sig" not in env:
+                return None
+
+
+            if STRICT_PQ2_ONLY and not env.get("pq_alg"):
+                logger.warning("Strict PQ2 mode: envelope missing PQ KEM.")
+                return None
+
+    inserted = 0
+    updated = 0
+    with db_connect(DB_FILE) as db:
+        cur = db.cursor()
+        for item in posts:
+            if not isinstance(item, dict):
+                continue
+            slug = (item.get("slug") or "").strip()
+            if not slug:
+                continue
+            title = item.get("title") or ""
+            content = item.get("content") or ""
+            summary = item.get("summary") or ""
+            tags = item.get("tags") or ""
+            status = (item.get("status") or "draft").strip()
+            created_at = item.get("created_at") or time.strftime("%Y-%m-%d %H:%M:%S")
+            updated_at = item.get("updated_at") or created_at
+
+            core: dict[str, Any] = {
+                "v": env.get("v", ""),
+                "alg": env.get("alg", ""),
+                "pq_alg": env.get("pq_alg", ""),
+                "pq_ct": env.get("pq_ct", ""),
+                "x_ephemeral_pub": env.get("x_ephemeral_pub", ""),
+                "wrap_nonce": env.get("wrap_nonce", ""),
+                "dek_wrapped": env.get("dek_wrapped", ""),
+                "data_nonce": env.get("data_nonce", ""),
+                "data_ct": env.get("data_ct", ""),
+                "comp": env.get("comp", {"alg": "none", "orig_len": None}),
+                "col_meta": env.get("col_meta", {}),
+                "policy": {
+                    "min_env_version": POLICY["min_env_version"],
+                    "require_sig_on_pq2": POLICY["require_sig_on_pq2"],
+                    "require_pq_if_available": POLICY["require_pq_if_available"],
+                },
+                "hd_ctx": env.get("hd_ctx", {}),
+            }
+            sig_payload = _canon_json(core)
+
+            if not key_manager.verify_blob(sig_pub, sig_val, sig_payload):
+                return None
+
+            km_sig_pub = cast(Optional[bytes], getattr(key_manager, "sig_pub", None))
+            if km_sig_pub is None or not sig_pub or _fp8(sig_pub) != _fp8(km_sig_pub):
+                return None
+
+
+            pq_ct       = b64d(cast(str, env["pq_ct"])) if env.get("pq_ct") else b""
+            eph_pub     = b64d(cast(str, env["x_ephemeral_pub"]))
+            wrap_nonce  = b64d(cast(str, env["wrap_nonce"]))
+            dek_wrapped = b64d(cast(str, env["dek_wrapped"]))
+            data_nonce  = b64d(cast(str, env["data_nonce"]))
+            data_ct     = b64d(cast(str, env["data_ct"]))
+
+def restore_blog_backup_if_db_empty() -> None:
+    # If DB has no blog posts but a backup file exists, restore automatically.
+    try:
+        with db_connect(DB_FILE) as db:
+            cur = db.cursor()
+            cur.execute("SELECT COUNT(1) FROM blog_posts")
+            count = int(cur.fetchone()[0] or 0)
+        if count > 0:
+            return
+        bp = _blog_backup_path()
+        if not bp.exists():
+            return
+        payload = json.loads(bp.read_text(encoding="utf-8"))
+        # Choose admin as default author.
+        with db_connect(DB_FILE) as db:
+            cur = db.cursor()
+            cur.execute("SELECT id FROM users WHERE is_admin=1 ORDER BY id ASC LIMIT 1")
+            row = cur.fetchone()
+        admin_id = int(row[0]) if row else 1
+        restore_blog_posts_from_json(payload, default_author_id=admin_id)
+        logger.info("Restored blog posts from backup file (DB was empty).")
+    except Exception as e:
+        logger.debug(f"Blog auto-restore skipped/failed: {e}")
+
+@app.route('/admin/blog/backup', methods=['GET'])
+
+        # -----------------------------
+        # Admin: Central console (users, billing, llama manager, blog tools)
+        # -----------------------------
+
+@app.route("/admin", methods=["GET"])
+def admin_console():
+    guard = _require_admin()
+    if guard:
+        return guard
+
+    csrf_token = generate_csrf()
+    with db_connect(DB_FILE) as db:
+        cur = db.cursor()
+        cur.execute("SELECT username, COALESCE(email,''), COALESCE(plan,'free'), COALESCE(is_admin,0), COALESCE(is_banned,0), banned_until, COALESCE(banned_reason,'') FROM users ORDER BY is_admin DESC, username ASC LIMIT 200")
+        rows = cur.fetchall()
+
+    users = []
+    for r in rows:
+        uname = r[0]
+        stats = get_user_query_stats(uname)
+        users.append({
+            "username": uname,
+            "email": r[1] or "",
+            "plan": r[2] or "free",
+            "is_admin": bool(r[3]),
+            "is_banned": bool(r[4]),
+            "banned_until": r[5],
+            "banned_reason": r[6] or "",
+            "c24": stats["count_24h"],
+            "c72": stats["count_72h"],
+            "call": stats["count_all"],
+        })
+
+    stripe_enabled = str(os.getenv("STRIPE_ENABLED", "false")).lower() in ("1", "true", "yes", "on")
+
+    usage_series = usage_series_days(14)
+    with db_connect(DB_FILE) as db:
+        cur = db.cursor()
+        cache_row = cur.execute("SELECT COUNT(*), COALESCE(SUM(LENGTH(response_json)),0) FROM api_cache").fetchone()
+        cache_stats = {"entries": int(cache_row[0] or 0), "bytes": int(cache_row[1] or 0)}
+        audits = cur.execute("SELECT ts, actor, action, target, meta FROM audit_log ORDER BY ts DESC LIMIT 60").fetchall()
+        flags = {
+            "MAINTENANCE_MODE": get_feature_flag(db, "MAINTENANCE_MODE", "false"),
+            "SCAN_ENABLED": get_feature_flag(db, "SCAN_ENABLED", "true"),
+            "WEATHER_ENABLED": get_feature_flag(db, "WEATHER_ENABLED", "true"),
+            "API_ENABLED": get_feature_flag(db, "API_ENABLED", "true"),
+            "REGISTRATION_ENABLED": get_feature_flag(db, "REGISTRATION_ENABLED", "true"),
+        }
+        # top users last 24h
+        top24 = cur.execute(
+            "SELECT username, COUNT(*) c FROM user_query_events WHERE ts >= ? GROUP BY username ORDER BY c DESC LIMIT 8",
+            (_now_ts() - 24*3600,),
+        ).fetchall()
+
+    return render_template_string("""
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Admin - QRoadScan</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="csrf-token" content="{{ csrf_token }}">
+  <link rel="stylesheet" href="{{ url_for('static', filename='css/bootstrap.min.css') }}">
+  <style>
+    :root{
+      --bg0:#070c18; --bg1:#0b1328;
+      --card:rgba(255,255,255,.06); --card2:rgba(255,255,255,.09);
+      --stroke:rgba(255,255,255,.12);
+      --text:#eef3ff; --mut:rgba(238,243,255,.72);
+      --a1:#60a5fa; --a2:#a78bfa;
+      --good:#2dd4bf; --warn:#fbbf24; --bad:#fb7185;
+      --r:18px; --shadow:0 18px 48px rgba(0,0,0,.55);
+    }
+    html,body{height:100%}
+    body{
+      margin:0; color:var(--text);
+      background: radial-gradient(1100px 650px at 15% 8%, rgba(96,165,250,.20), transparent 55%),
+                  radial-gradient(900px 620px at 82% 10%, rgba(167,139,250,.18), transparent 55%),
+                  linear-gradient(180deg, var(--bg0), var(--bg1));
+      font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Arial;
+    }
+    .wrap{max-width:1280px;margin:0 auto;padding:18px 14px 46px}
+    .hero{
+      display:flex; gap:12px; align-items:flex-start; justify-content:space-between; flex-wrap:wrap;
+      padding:16px 16px; border:1px solid var(--stroke); border-radius:var(--r);
+      background:linear-gradient(180deg, rgba(255,255,255,.08), rgba(255,255,255,.04));
+      box-shadow:var(--shadow);
+    }
+    .hero h1{font-size:18px;margin:0 0 6px;letter-spacing:.2px}
+    .hero .sub{color:var(--mut);font-size:13px;margin:0}
+    .pill{
+      display:inline-flex; align-items:center; gap:8px;
+      padding:8px 10px; border:1px solid var(--stroke); border-radius:999px;
+      background:rgba(0,0,0,.20); color:var(--mut); font-size:12px;
+      white-space:nowrap;
+    }
+    .pill strong{color:var(--text); font-weight:700}
+    .grid{
+      margin-top:14px;
+      display:grid; gap:12px;
+      grid-template-columns: 1fr;
+    }
+    @media(min-width:992px){
+      .grid{grid-template-columns: 1.5fr 1fr;}
+      .wide{grid-column:1/-1;}
+    }
+    .card{
+      border:1px solid var(--stroke); border-radius:var(--r);
+      background:linear-gradient(180deg, rgba(255,255,255,.07), rgba(255,255,255,.04));
+      box-shadow:var(--shadow);
+      overflow:hidden;
+    }
+    .card .hd{
+      padding:12px 14px;
+      display:flex; align-items:center; justify-content:space-between; gap:10px; flex-wrap:wrap;
+      border-bottom:1px solid rgba(255,255,255,.10);
+      background:rgba(0,0,0,.15);
+    }
+    .card .hd h2{font-size:14px;margin:0}
+    .card .bd{padding:12px 14px}
+    .tabs{
+      display:flex; gap:8px; flex-wrap:wrap;
+    }
+    .tabbtn{
+      appearance:none; border:1px solid var(--stroke); background:rgba(0,0,0,.20);
+      color:var(--mut); padding:8px 10px; border-radius:999px; font-size:12px;
+      cursor:pointer; user-select:none;
+      transition:transform .06s ease, background .15s ease, color .15s ease;
+    }
+    .tabbtn.active{
+      color:var(--text);
+      background:linear-gradient(135deg, rgba(96,165,250,.30), rgba(167,139,250,.28));
+      border-color:rgba(255,255,255,.18);
+    }
+    .tabpane{display:none}
+    .tabpane.active{display:block}
+    .mut{color:var(--mut)}
+    .mini{font-size:12px;color:var(--mut)}
+    .table-wrap{overflow:auto;border-radius:14px;border:1px solid rgba(255,255,255,.10)}
+    table{width:100%;border-collapse:collapse}
+    th,td{padding:10px 10px; vertical-align:middle}
+    th{font-size:11px; text-transform:uppercase; letter-spacing:.08em; color:rgba(238,243,255,.70); background:rgba(0,0,0,.22); position:sticky; top:0}
+    tr{border-bottom:1px solid rgba(255,255,255,.08)}
+    tr:last-child{border-bottom:none}
+    input,select,textarea{
+      width:100%; border-radius:12px;
+      border:1px solid rgba(255,255,255,.14);
+      background:rgba(0,0,0,.20);
+      color:var(--text); padding:8px 10px; font-size:13px;
+      outline:none;
+    }
+    textarea{min-height:38px}
+    .btnq{
+      width:100%;
+      appearance:none; border:1px solid rgba(255,255,255,.18);
+      background:linear-gradient(180deg, rgba(255,255,255,.12), rgba(255,255,255,.06));
+      color:var(--text); border-radius:14px;
+      padding:9px 10px; font-weight:700; font-size:13px;
+      text-align:center; cursor:pointer;
+      transition:transform .06s ease, filter .15s ease;
+    }
+    .btnq:hover{filter:brightness(1.05)}
+    .btnq:active{transform:translateY(1px)}
+    .btnq.primary{
+      border-color:rgba(96,165,250,.30);
+      background:linear-gradient(135deg, rgba(96,165,250,.75), rgba(167,139,250,.70));
+    }
+    .btnq.danger{
+      border-color:rgba(251,113,133,.30);
+      background:linear-gradient(135deg, rgba(251,113,133,.65), rgba(244,63,94,.55));
+    }
+    .row2{display:grid; grid-template-columns:1fr; gap:10px}
+    @media(min-width:992px){ .row2{grid-template-columns:1fr 1fr;} }
+    .bars{display:flex; align-items:flex-end; gap:6px; height:72px; padding:10px; border-radius:14px; border:1px solid rgba(255,255,255,.10); background:rgba(0,0,0,.18)}
+    .bar{flex:1; border-radius:10px 10px 6px 6px; background:linear-gradient(180deg, rgba(96,165,250,.85), rgba(167,139,250,.75)); min-width:6px}
+    .kpi{display:flex; gap:10px; flex-wrap:wrap}
+    .kpi .pill{background:rgba(0,0,0,.18)}
+    .split{display:grid;grid-template-columns:1fr;gap:10px}
+    @media(min-width:992px){.split{grid-template-columns:1.1fr .9fr}}
+    .mono{font-family:ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', 'Courier New', monospace}
+    .link{color:var(--text); text-decoration:none}
+    .link:hover{text-decoration:underline}
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="hero">
+      <div>
+        <h1>Admin Console</h1>
+        <p class="sub">Central command: users, billing, cache, models, backups, security.</p>
+      </div>
+      <div class="kpi">
+        <span class="pill"><strong>{{ cache_stats.entries }}</strong> cache entries</span>
+        <span class="pill"><strong>{{ (cache_stats.bytes/1024)|round(1) }}</strong> KB cached</span>
+        <span class="pill">Maintenance: <strong>{{ flags.MAINTENANCE_MODE }}</strong></span>
+        <span class="pill">Scan: <strong>{{ flags.SCAN_ENABLED }}</strong></span>
+        <span class="pill">API: <strong>{{ flags.API_ENABLED }}</strong></span>
+      </div>
+    </div>
+
+    <div class="card" style="margin-top:12px">
+      <div class="hd">
+        <h2>Console</h2>
+        <div class="tabs" id="tabs">
+          <button class="tabbtn active" data-tab="users">Users</button>
+          <button class="tabbtn" data-tab="analytics">Analytics</button>
+          <button class="tabbtn" data-tab="billing">Billing</button>
+          <button class="tabbtn" data-tab="cache">Cache</button>
+          <button class="tabbtn" data-tab="security">Security</button>
+          <button class="tabbtn" data-tab="tools">Tools</button>
+          <button class="tabbtn" data-tab="audit">Audit</button>
+        </div>
+      </div>
+
+      <div class="bd">
+        <!-- USERS -->
+        <section class="tabpane active" id="tab-users">
+          <div class="mini" style="margin-bottom:10px">Manage plans, bans, and API keys. Counts show queries in last 24h / 72h / all-time.</div>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>User</th><th>Email</th><th>Plan</th><th>Usage</th><th>Status</th><th style="min-width:280px">Actions</th>
+                </tr>
+              </thead>
+              <tbody>
+              {% for u in users %}
+                <tr>
+                  <td class="mono">{{ u.username }}</td>
+                  <td class="mono">{{ u.email }}</td>
+                  <td>
+                    <form method="POST" action="{{ url_for('admin_user_update') }}">
+                      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                      <input type="hidden" name="username" value="{{ u.username }}">
+                      <input type="hidden" name="action" value="save">
+                      <select name="plan" onchange="this.form.submit()">
+                        <option value="free" {% if u.plan=='free' %}selected{% endif %}>free</option>
+                        <option value="pro" {% if u.plan=='pro' %}selected{% endif %}>pro</option>
+                        <option value="corp" {% if u.plan in ['corp','corporate'] %}selected{% endif %}>corp</option>
+                      </select>
+                    </form>
+                  </td>
+                  <td class="mono">{{ u.c24 }} / {{ u.c72 }} / {{ u.call }}</td>
+                  <td>
+                    {% if u.is_admin %}<span class="pill"><strong>admin</strong></span>{% endif %}
+                    {% if u.is_banned %}<span class="pill" style="border-color:rgba(251,113,133,.35)">banned</span>{% else %}<span class="pill" style="border-color:rgba(45,212,191,.35)">active</span>{% endif %}
+                  </td>
+                  <td>
+                    <div class="row2">
+                      <form method="POST" action="{{ url_for('admin_user_update') }}">
+                        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                        <input type="hidden" name="username" value="{{ u.username }}">
+                        <input type="hidden" name="plan" value="{{ u.plan }}">
+                        <input type="hidden" name="action" value="ban">
+                        <div class="row2">
+                          <input name="ban_hours" placeholder="Ban hours (e.g. 24)" value="">
+                          <input name="ban_reason" placeholder="Reason" value="">
+                        </div>
+                        <button class="btnq danger" type="submit" style="margin-top:8px">Ban</button>
+                      </form>
+
+                      <div>
+                        <form method="POST" action="{{ url_for('admin_user_update') }}" style="margin-bottom:8px">
+                          <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                          <input type="hidden" name="username" value="{{ u.username }}">
+                          <input type="hidden" name="plan" value="{{ u.plan }}">
+                          <input type="hidden" name="action" value="unban">
+                          <button class="btnq" type="submit">Unban</button>
+                        </form>
+                        <form method="POST" action="{{ url_for('admin_user_update') }}">
+                          <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                          <input type="hidden" name="username" value="{{ u.username }}">
+                          <input type="hidden" name="plan" value="{{ u.plan }}">
+                          <input type="hidden" name="action" value="revoke_api">
+                          <button class="btnq" type="submit">Revoke API keys</button>
+                        </form>
+                      </div>
+                    </div>
+                  </td>
+                </tr>
+              {% endfor %}
+              </tbody>
+            </table>
+          </div>
+        </section>
+
+        <!-- ANALYTICS -->
+        <section class="tabpane" id="tab-analytics">
+          <div class="split">
+            <div class="card" style="box-shadow:none;background:transparent;border:none">
+              <div class="mini" style="margin-bottom:8px">Total query events (last 14 days)</div>
+              <div class="bars" aria-label="14 day usage">
+                {% set maxv = (usage_series | map(attribute='count') | max) if usage_series else 1 %}
+                {% for p in usage_series %}
+                  {% set h = ( (p.count / (maxv if maxv else 1)) * 68 ) %}
+                  <div class="bar" title="{{ p.day }}: {{ p.count }}" style="height: {{ 6 + h }}px"></div>
+                {% endfor %}
+              </div>
+              <div class="mini" style="margin-top:8px">Today: <strong>{{ usage_series[-1].count if usage_series else 0 }}</strong></div>
+            </div>
+            <div>
+              <div class="mini" style="margin-bottom:8px">Top users (last 24h)</div>
+              <div class="table-wrap">
+                <table>
+                  <thead><tr><th>User</th><th>Count</th></tr></thead>
+                  <tbody>
+                    {% for tu in top24 %}
+                      <tr><td class="mono">{{ tu[0] }}</td><td class="mono">{{ tu[1] }}</td></tr>
+                    {% else %}
+                      <tr><td colspan="2" class="mini">No recent usage.</td></tr>
+                    {% endfor %}
+                  </tbody>
+                </table>
+              </div>
+              <p class="mini" style="margin-top:10px">Tip: paid tiers can have higher daily limits and longer context windows.</p>
+            </div>
+          </div>
+        </section>
+
+        <!-- BILLING -->
+        <section class="tabpane" id="tab-billing">
+          <div class="row2">
+            <div class="card" style="box-shadow:none">
+              <div class="hd"><h2>Plans</h2></div>
+              <div class="bd">
+                <div class="pill">Pro: <strong>$14 / month</strong></div>
+                <div class="pill" style="margin-top:8px">Corporate: <strong>$500 / month</strong> (5–400 users)</div>
+                <p class="mini" style="margin-top:10px">Stripe enabled: <strong>{{ 'true' if stripe_enabled else 'false' }}</strong></p>
+                <p class="mini">Users on paid plans get higher limits + longer context windows.</p>
+              </div>
+            </div>
+            <div class="card" style="box-shadow:none">
+              <div class="hd"><h2>Quick links</h2></div>
+              <div class="bd">
+                <a class="btnq primary link" href="{{ url_for('dashboard') }}">Back to Dashboard</a>
+                <div style="height:10px"></div>
+                <a class="btnq link" href="{{ url_for('register') }}">Registration Page</a>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <!-- CACHE -->
+        <section class="tabpane" id="tab-cache">
+          <div class="row2">
+            <div>
+              <div class="mini" style="margin-bottom:8px">Purge cache by prefix (endpoint or key prefix). Empty purges all.</div>
+              <form method="POST" action="{{ url_for('admin_cache_purge') }}">
+                <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                <input name="prefix" placeholder="Prefix (optional)" value="">
+                <button class="btnq danger" type="submit" style="margin-top:10px">Purge cache</button>
+              </form>
+              <p class="mini" style="margin-top:10px">Cache entries: <strong>{{ cache_stats.entries }}</strong></p>
+            </div>
+            <div>
+              <div class="mini" style="margin-bottom:8px">Notes</div>
+              <div class="pill">DB-backed caching</div>
+              <div class="pill" style="margin-top:8px">Safe purge via parameterized queries</div>
+              <div class="pill" style="margin-top:8px">External provider calls hardened via httpx</div>
+            </div>
+          </div>
+        </section>
+
+        <!-- SECURITY -->
+        <section class="tabpane" id="tab-security">
+          <div class="mini" style="margin-bottom:10px">Feature flags are stored in the config table. Maintenance mode blocks non-admins (except login/logout).</div>
+          <form method="POST" action="{{ url_for('admin_flags_update') }}">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+            <div class="row2">
+              <label class="mini"><input type="checkbox" name="MAINTENANCE_MODE" {% if flags.MAINTENANCE_MODE in ['true','1','yes','on'] %}checked{% endif %}> Maintenance Mode</label>
+              <label class="mini"><input type="checkbox" name="REGISTRATION_ENABLED" {% if flags.REGISTRATION_ENABLED in ['true','1','yes','on'] %}checked{% endif %}> Registration Enabled</label>
+              <label class="mini"><input type="checkbox" name="SCAN_ENABLED" {% if flags.SCAN_ENABLED in ['true','1','yes','on'] %}checked{% endif %}> Scan Enabled</label>
+              <label class="mini"><input type="checkbox" name="WEATHER_ENABLED" {% if flags.WEATHER_ENABLED in ['true','1','yes','on'] %}checked{% endif %}> Weather Enabled</label>
+              <label class="mini"><input type="checkbox" name="API_ENABLED" {% if flags.API_ENABLED in ['true','1','yes','on'] %}checked{% endif %}> API Enabled</label>
+            </div>
+            <button class="btnq primary" type="submit" style="margin-top:10px">Save Security Flags</button>
+          </form>
+        </section>
+
+        <!-- TOOLS -->
+        <section class="tabpane" id="tab-tools">
+          <div class="row2">
+            <div>
+              <a class="btnq link" href="{{ url_for('admin_local_llm') }}">Local LLM Manager</a>
+              <div style="height:10px"></div>
+              <a class="btnq link" href="{{ url_for('admin_blog_backup_page') }}">Blog Backup & Restore</a>
+              <p class="mini" style="margin-top:10px">These tools remain available as dedicated pages, but are now centralized here for navigation.</p>
+            </div>
+            <div>
+              <div class="mini" style="margin-bottom:6px">Quick actions</div>
+              <a class="btnq primary link" href="{{ url_for('weather_page') }}">Weather Intelligence</a>
+              <div style="height:10px"></div>
+              <a class="btnq link" href="{{ url_for('settings') }}">System Settings</a>
+            </div>
+          </div>
+
+          <div class="row2" style="margin-top:12px">
+            <div class="card" style="background:rgba(0,0,0,.14); border:1px solid rgba(255,255,255,.10); box-shadow:none">
+              <div class="hd"><h2>Impersonation</h2><div class="mini">Admin-only diagnostic</div></div>
+              <div class="bd">
+                <form method="POST" action="{{ url_for('admin_impersonate') }}">
+                  <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                  <input name="username" placeholder="Username to impersonate">
+                  <button class="btnq primary" type="submit" style="margin-top:10px">Impersonate</button>
+                </form>
+                <form method="POST" action="{{ url_for('admin_impersonate_stop') }}" style="margin-top:10px">
+                  <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                  <button class="btnq" type="submit">Stop Impersonation</button>
+                </form>
+                <p class="mini" style="margin-top:10px">Impersonation is logged in Audit and requires CSRF + admin session.</p>
+              </div>
+            </div>
+
+            <div class="card" style="background:rgba(0,0,0,.14); border:1px solid rgba(255,255,255,.10); box-shadow:none">
+              <div class="hd"><h2>Exports</h2><div class="mini">CSV for offline review</div></div>
+              <div class="bd">
+                <a class="btnq link" href="{{ url_for('admin_export_users_csv') }}">Export Users CSV</a>
+                <div style="height:10px"></div>
+                <a class="btnq link" href="{{ url_for('admin_export_usage_csv') }}">Export Usage CSV</a>
+                <div style="height:10px"></div>
+                <form method="POST" action="{{ url_for('admin_dispatch_alerts') }}">
+                  <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                  <button class="btnq" type="submit">Dispatch Alerts (manual)</button>
+                </form>
+                <p class="mini" style="margin-top:10px">Use the dispatch endpoint with a cron job for automation.</p>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <!-- AUDIT -->
+        <section class="tabpane" id="tab-audit">
+          <div class="mini" style="margin-bottom:10px">Recent admin/security events.</div>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>Time</th><th>Actor</th><th>Action</th><th>Target</th><th>Meta</th></tr></thead>
+              <tbody>
+                {% for a in audits %}
+                  <tr>
+                    <td class="mono">{{ (a[0] | int) | datetimeformat }}</td>
+                    <td class="mono">{{ a[1] }}</td>
+                    <td class="mono">{{ a[2] }}</td>
+                    <td class="mono">{{ a[3] }}</td>
+                    <td class="mono" style="max-width:420px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">{{ a[4] }}</td>
+                  </tr>
+                {% else %}
+                  <tr><td colspan="5" class="mini">No audit events yet.</td></tr>
+                {% endfor %}
+              </tbody>
+            </table>
+          </div>
+        </section>
+
+      </div>
+    </div>
+  </div>
+
+<script>
+(function(){
+  const btns = Array.from(document.querySelectorAll('.tabbtn'));
+  const panes = {
+    users: document.getElementById('tab-users'),
+    analytics: document.getElementById('tab-analytics'),
+    billing: document.getElementById('tab-billing'),
+    cache: document.getElementById('tab-cache'),
+    security: document.getElementById('tab-security'),
+    tools: document.getElementById('tab-tools'),
+    audit: document.getElementById('tab-audit'),
+  };
+  function setTab(name){
+    btns.forEach(b=>b.classList.toggle('active', b.dataset.tab===name));
+    Object.keys(panes).forEach(k=>panes[k].classList.toggle('active', k===name));
+    try{ localStorage.setItem('qrs_admin_tab', name); }catch(e){}
+  }
+  btns.forEach(b=>b.addEventListener('click', ()=>setTab(b.dataset.tab)));
+  let saved = null;
+  try{ saved = localStorage.getItem('qrs_admin_tab'); }catch(e){}
+  if(saved && panes[saved]) setTab(saved);
+})();
+</script>
+</body>
+</html>
+""",
+csrf_token=csrf_token,
+users=users,
+stripe_enabled=stripe_enabled,
+cache_stats=cache_stats,
+usage_series=usage_series,
+top24=top24,
+flags=SimpleNamespace(**flags),
+audits=audits)
+
+
+
+@app.post("/admin/users/update")
+def admin_user_update():
+    guard = _require_admin()
+    if guard:
+        return guard
+    token = request.form.get("csrf_token", "")
+    try:
+        validate_csrf(token)
+    except ValidationError:
+        flash("CSRF invalid.", "danger")
+        return redirect(url_for("admin_console"))
+
+    username = normalize_username(request.form.get("username", ""))
+    action = request.form.get("action", "save")
+    plan = (request.form.get("plan", "free") or "free").strip().lower()
+    ban_reason = (request.form.get("ban_reason", "") or "").strip()
+    ban_hours_raw = (request.form.get("ban_hours", "") or "").strip()
+
+    if plan not in ("free", "pro", "corp", "corporate"):
+        plan = "free"
+
+    ban_until = None
+    if ban_hours_raw:
+        try:
+            hrs = int(float(ban_hours_raw))
+            if hrs > 0:
+                ban_until = _now_ts() + hrs * 3600
+        except Exception:
+            ban_until = None
+
+    with db_connect(DB_FILE) as db:
+        cur = db.cursor()
+        if action == "ban":
+            cur.execute(
+                "UPDATE users SET is_banned=1, banned_until=?, banned_reason=? WHERE username=?",
+                (ban_until, ban_reason[:300], username),
+            )
+            audit_log_event("admin_user_ban", actor=session.get("username", ""), target=username, meta={"until": ban_until, "reason": ban_reason[:300]})
+        elif action == "unban":
+            cur.execute("UPDATE users SET is_banned=0, banned_until=NULL, banned_reason=NULL WHERE username=?", (username,))
+            audit_log_event("admin_user_unban", actor=session.get("username", ""), target=username)
+        elif action == "revoke_api":
+            cur.execute("UPDATE api_keys SET revoked=1 WHERE user_id = (SELECT id FROM users WHERE username=?)", (username,))
+            audit_log_event("admin_user_revoke_api", actor=session.get("username", ""), target=username)
+
+        # always allow plan update for admins
+        cur.execute("UPDATE users SET plan=? WHERE username=?", (plan, username))
+        db.commit()
+
+    flash("User updated.", "success")
+    return redirect(url_for("admin_console"))
+
+
+@app.post("/admin/cache/purge")
+def admin_cache_purge():
+    guard = _require_admin()
+    if guard:
+        return guard
+    token = request.form.get("csrf_token", "")
+    try:
+        validate_csrf(token)
+    except ValidationError:
+        flash("CSRF invalid.", "danger")
+        return redirect(url_for("admin_console"))
+    prefix = (request.form.get("prefix", "") or "").strip()
+    with db_connect(DB_FILE) as db:
+        if prefix:
+            db.execute("DELETE FROM api_cache WHERE endpoint LIKE ? OR cache_key LIKE ?", (f"{prefix}%", f"{prefix}%"))
+        else:
+            db.execute("DELETE FROM api_cache")
+        db.commit()
+    audit_log_event("admin_cache_purge", actor=session.get("username", ""), target=prefix or "*")
+    flash("Cache purged.", "success")
+    return redirect(url_for("admin_console"))
+
+
+@app.post("/admin/flags/update")
+def admin_flags_update():
+    guard = _require_admin()
+    if guard:
+        return guard
+    token = request.form.get("csrf_token", "")
+    try:
+        validate_csrf(token)
+    except ValidationError:
+        flash("CSRF invalid.", "danger")
+        return redirect(url_for("admin_console"))
+    updates = {}
+    for k in ("MAINTENANCE_MODE", "SCAN_ENABLED", "WEATHER_ENABLED", "API_ENABLED", "REGISTRATION_ENABLED"):
+        updates[k] = "true" if request.form.get(k) == "on" else "false"
+    with db_connect(DB_FILE) as db:
+        for k, v in updates.items():
+            set_feature_flag(db, k, v)
+    audit_log_event("admin_flags_update", actor=session.get("username", ""), meta=updates)
+    flash("Settings updated.", "success")
+    return redirect(url_for("admin_console"))
+
+
+@app.post("/admin/impersonate")
+def admin_impersonate():
+    guard = _require_admin()
+    if guard:
+        return guard
+    token = request.form.get("csrf_token", "")
+    try:
+        validate_csrf(token)
+    except ValidationError:
+        flash("CSRF invalid.", "danger")
+        return redirect(url_for("admin_console"))
+    target = normalize_username(request.form.get("username", ""))
+    if not target:
+        flash("Missing username.", "warning")
+        return redirect(url_for("admin_console"))
+    # Cannot impersonate a different admin unless explicitly allowed
+    with db_connect(DB_FILE) as db:
+        row = db.execute("SELECT COALESCE(is_admin,0), COALESCE(is_banned,0) FROM users WHERE username = ?", (target,)).fetchone()
+    if not row:
+        flash("User not found.", "warning")
+        return redirect(url_for("admin_console"))
+    if int(row[0] or 0) == 1 and target != session.get("username"):
+        flash("Refusing to impersonate another admin.", "danger")
+        return redirect(url_for("admin_console"))
+    if int(row[1] or 0) == 1:
+        flash("Cannot impersonate banned user.", "danger")
+        return redirect(url_for("admin_console"))
+
+    session.setdefault("admin_real_username", session.get("username"))
+    session["admin_impersonating"] = True
+    session["username"] = target
+    session["is_admin"] = False
+    audit_log_event("admin_impersonate_start", actor=session.get("admin_real_username", ""), target=target)
+    flash("Impersonation active.", "success")
+    return redirect(url_for("dashboard"))
+
+
+@app.post("/admin/impersonate/stop")
+def admin_impersonate_stop():
+    token = request.form.get("csrf_token", "")
+    try:
+        validate_csrf(token)
+    except ValidationError:
+        flash("CSRF invalid.", "danger")
+        return redirect(url_for("login"))
+    real = session.get("admin_real_username")
+    if not real:
+        flash("No active impersonation.", "warning")
+        return redirect(url_for("login"))
+    session.clear()
+    session["username"] = real
+    session["is_admin"] = True
+    audit_log_event("admin_impersonate_stop", actor=real)
+    flash("Returned to admin session.", "success")
+    return redirect(url_for("admin_console"))
+
+
+@app.get("/admin/export/users.csv")
+def admin_export_users_csv():
+    guard = _require_admin()
+    if guard:
+        return guard
+    with db_connect(DB_FILE) as db:
+        rows = db.execute(
+            "SELECT username, COALESCE(email,''), COALESCE(plan,'free'), COALESCE(is_admin,0), COALESCE(is_banned,0), COALESCE(banned_until,''), COALESCE(risk_score,0), COALESCE(throttle_until,'') FROM users ORDER BY username ASC"
+        ).fetchall()
+    out = ["username,email,plan,is_admin,is_banned,banned_until,risk_score,throttle_until"]
+    for r in rows:
+        out.append(",".join([
+            str(r[0] or ""),
+            str(r[1] or "").replace(",", " "),
+            str(r[2] or ""),
+            str(int(r[3] or 0)),
+            str(int(r[4] or 0)),
+            str(r[5] or ""),
+            str(r[6] or 0),
+            str(r[7] or ""),
+        ]))
+    audit_log_event("admin_export_users", actor=session.get("username", ""))
+    return Response("\n".join(out) + "\n", mimetype="text/csv", headers={"Content-Disposition": "attachment; filename=users.csv"})
+
+
+@app.get("/admin/export/usage.csv")
+def admin_export_usage_csv():
+    guard = _require_admin()
+    if guard:
+        return guard
+    since = _now_ts() - 72 * 3600
+    with db_connect(DB_FILE) as db:
+        rows = db.execute(
+            "SELECT username, kind, ts FROM user_query_events WHERE ts >= ? ORDER BY ts DESC LIMIT 50000",
+            (since,),
+        ).fetchall()
+    out = ["username,kind,ts"]
+    for r in rows:
+        out.append(f"{r[0]},{r[1]},{int(r[2] or 0)}")
+    audit_log_event("admin_export_usage", actor=session.get("username", ""), meta={"window_hours": 72, "rows": len(rows)})
+    return Response("\n".join(out) + "\n", mimetype="text/csv", headers={"Content-Disposition": "attachment; filename=usage_72h.csv"})
+
+
+def _alerts_dispatch_allowed() -> bool:
+    # Admin session OR a cron token.
+    if session.get("is_admin"):
+        return True
+    token = (request.args.get("token", "") or "").strip()
+    expected = (os.getenv("ADMIN_CRON_TOKEN", "") or "").strip()
+    if expected and token and secrets.compare_digest(token, expected):
+        return True
+    return False
+
+
+@app.post("/admin/alerts/dispatch")
+def admin_dispatch_alerts():
+    guard = _require_admin()
+    if guard:
+        return guard
+    token = request.form.get("csrf_token", "")
+    try:
+        validate_csrf(token)
+    except ValidationError:
+        flash("CSRF invalid.", "danger")
+        return redirect(url_for("admin_console"))
+    sent = dispatch_due_alerts(max_to_send=int(os.getenv("ALERTS_DISPATCH_MAX", "50")))
+    audit_log_event("admin_alerts_dispatch", actor=session.get("username", ""), meta={"sent": sent})
+    flash(f"Dispatched {sent} alerts.", "success")
+    return redirect(url_for("admin_console"))
+
+
+@app.get("/admin/alerts/dispatch")
+def admin_dispatch_alerts_cron():
+    if not _alerts_dispatch_allowed():
+        return jsonify(ok=False, error="forbidden"), 403
+    sent = dispatch_due_alerts(max_to_send=int(os.getenv("ALERTS_DISPATCH_MAX", "150")))
+    return jsonify(ok=True, sent=sent)
+
+    audit_log_event("admin_user_update", actor=session.get("username",""), target=username, meta={"action": action, "plan": plan})
+    flash("User updated.", "success")
+    return redirect(url_for("admin_console"))
+
+def admin_blog_backup_page():
+    guard = _require_admin()
+    if guard:
+        return guard
+    csrf_token = generate_csrf()
+    bp = _blog_backup_path()
+    status = {
+        "backup_path": str(bp),
+        "backup_exists": bp.exists(),
+        "backup_bytes": bp.stat().st_size if bp.exists() else 0,
+    }
+    return render_template_string("""
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Admin - Blog Backup</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <link rel="stylesheet" href="{{ url_for('static', filename='css/bootstrap.min.css') }}"
+        integrity="sha256-Ww++W3rXBfapN8SZitAvc9jw2Xb+Ixt0rvDsmWmQyTo=" crossorigin="anonymous">
+</head>
+<body class="bg-dark text-light">
+<div class="container py-4">
+  <h2>Blog Backup / Restore</h2>
+  <p class="text-muted">Backup path: <code>{{ status.backup_path }}</code></p>
+  <p class="text-muted">Backup exists: {{ 'yes' if status.backup_exists else 'no' }} ({{ status.backup_bytes }} bytes)</p>
+
+
+            ss_pq = b""
+            if env.get("pq_alg") and oqs is not None and key_manager._pq_alg_name:
+                oqs_mod = cast(Any, oqs)
+                with oqs_mod.KeyEncapsulation(key_manager._pq_alg_name, key_manager._decrypt_pq_priv()) as kem:
+                    ss_pq = kem.decap_secret(pq_ct)
+            else:
+                if STRICT_PQ2_ONLY:
+                    if not dec_guard.register_failure():
+                        logger.error("Strict PQ2: missing PQ decapsulation capability.")
+                    return None
+
+
+            col_meta = cast(dict[str, Any], env.get("col_meta") or {})
+            col_info = json.dumps(
+                {
+                    "qid25": str(col_meta.get("qid25", "")),
+                    "hx": str(col_meta.get("hex", "")),
+                    "en": float(col_meta.get("entropy_norm", 0.0)),
+                    "ep": str(col_meta.get("epoch", "")),
+                },
+                separators=(",", ":"),
+            ).encode()
+
+            hd_ctx = cast(dict[str, Any], env.get("hd_ctx") or {})
+            dk = b""
+            domain_val = hd_ctx.get("domain")
+            if isinstance(domain_val, str) and domain_val:
+                try:
+                    dk = derive_domain_key(
+                        domain_val,
+                        str(hd_ctx.get("field", "")),
+                        int(hd_ctx.get("epoch", 1)),
+                    )
+                except Exception:
+                    dk = b""
+
+
+            wrap_info = WRAP_INFO + b"|" + col_info + (b"|HD" if hd_ctx else b"")
+            wrap_key = hkdf_sha3(ss_x + ss_pq + dk, info=wrap_info, length=32)
+
+            try:
+                dek = AESGCM(wrap_key).decrypt(wrap_nonce, dek_wrapped, None)
+            except Exception:
+                if not dec_guard.register_failure():
+                    logger.error("AEAD failure budget exceeded.")
+                return None
+
+            try:
+                plaintext_comp = AESGCM(dek).decrypt(data_nonce, data_ct, None)
+            except Exception:
+                if not dec_guard.register_failure():
+                    logger.error("AEAD failure budget exceeded.")
+                return None
+
+        # -----------------------------
+        # Admin: Local Llama model manager (download/encrypt/decrypt)
+        # -----------------------------
+
+            return plaintext.decode("utf-8")
+
+
+        logger.warning("Rejected non-PQ2 ciphertext (strict PQ2 mode).")
+        return None
+
+    except Exception as e:
+        logger.error(f"decrypt_data failed: {e}", exc_info=True)
+        return None
+
+
+def _gen_overwrite_patterns(passes: int):
+    charset = string.ascii_letters + string.digits + string.punctuation
+    patterns = [
+        lambda: ''.join(secrets.choice(charset) for _ in range(64)),
+        lambda: '0' * 64, lambda: '1' * 64,
+        lambda: ''.join(secrets.choice(charset) for _ in range(64)),
+        lambda: 'X' * 64, lambda: 'Y' * 64,
+        lambda: ''.join(secrets.choice(charset) for _ in range(64))
+    ]
+    if passes > len(patterns):
+        patterns = patterns * (passes // len(patterns)) + patterns[:passes % len(patterns)]
+    else:
+        patterns = patterns[:passes]
+    return patterns
+
+def _values_for_types(col_types_ordered: list[tuple[str, str]], pattern_func):
+    vals = []
+    for _, typ in col_types_ordered:
+        t = typ.upper()
+        if t in ("TEXT", "CHAR", "VARCHAR", "CLOB"):
+            vals.append(pattern_func())
+        elif t in ("INTEGER", "INT", "BIGINT", "SMALLINT", "TINYINT"):
+            vals.append(secrets.randbits(64) - (2**63))
+        elif t in ("REAL", "DOUBLE", "FLOAT"):
+            vals.append(secrets.randbits(64) / (2**64))
+        elif t == "BLOB":
+            vals.append(secrets.token_bytes(64))
+        elif t == "BOOLEAN":
+            vals.append(secrets.choice([0, 1]))
+        else:
+            vals.append(pattern_func())
+    return vals
+
+
+dev = qml.device("default.qubit", wires=5)
+
+
+def get_cpu_ram_usage():
+    return psutil.cpu_percent(), psutil.virtual_memory().percent
+
+
+@qml.qnode(dev)
+def quantum_hazard_scan(cpu_usage, ram_usage):
+    if qml is None:
+        return None
+    cpu_param = cpu_usage / 100
+    ram_param = ram_usage / 100
+    qml.RY(np.pi * cpu_param, wires=0)
+    qml.RY(np.pi * ram_param, wires=1)
+    qml.RY(np.pi * (0.5 + cpu_param), wires=2)
+    qml.RY(np.pi * (0.5 + ram_param), wires=3)
+    qml.RY(np.pi * (0.5 + cpu_param), wires=4)
+    qml.CNOT(wires=[0, 1])
+    qml.CNOT(wires=[1, 2])
+    qml.CNOT(wires=[2, 3])
+    qml.CNOT(wires=[3, 4])
+    return qml.probs(wires=[0, 1, 2, 3, 4])
+
+registration_enabled = True
+
+try:
+    quantum_hazard_scan
+except NameError:
+    quantum_hazard_scan = None  
+
+def create_tables():
+    if not DB_FILE.exists():
+        DB_FILE.touch(mode=0o600)
+    with db_connect(DB_FILE) as db:
+        cursor = db.cursor()
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                id INTEGER PRIMARY KEY,
+                username TEXT UNIQUE NOT NULL,
+                password TEXT NOT NULL,
+                is_admin BOOLEAN DEFAULT 0,
+                preferred_model TEXT DEFAULT 'openai',
+                google_sub TEXT UNIQUE,
+                email TEXT
+            )
+        """)
+
+        cursor.execute("PRAGMA table_info(users)")
+        users_existing = {row[1] for row in cursor.fetchall()}
+        # Migrations: add new columns safely for existing deployments.
+        users_alter_map = {
+            "google_sub": "ALTER TABLE users ADD COLUMN google_sub TEXT",
+            "email": "ALTER TABLE users ADD COLUMN email TEXT",
+            "plan": "ALTER TABLE users ADD COLUMN plan TEXT DEFAULT 'free'",
+            "is_banned": "ALTER TABLE users ADD COLUMN is_banned INTEGER DEFAULT 0",
+            "banned_until": "ALTER TABLE users ADD COLUMN banned_until INTEGER",
+            "banned_reason": "ALTER TABLE users ADD COLUMN banned_reason TEXT",
+            "last_lat": "ALTER TABLE users ADD COLUMN last_lat REAL",
+            "last_lon": "ALTER TABLE users ADD COLUMN last_lon REAL",
+            "throttle_until": "ALTER TABLE users ADD COLUMN throttle_until INTEGER",
+            "risk_score": "ALTER TABLE users ADD COLUMN risk_score REAL DEFAULT 0",
+        }
+        for col, alter_sql in users_alter_map.items():
+            if col not in users_existing:
+                cursor.execute(alter_sql)
+
+        # SQLite cannot add UNIQUE via ALTER TABLE; enforce via partial index.
+        cursor.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_users_google_sub_unique ON users(google_sub) WHERE google_sub IS NOT NULL"
+        )
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_users_plan ON users(plan)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_users_banned ON users(is_banned)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_users_throttle ON users(throttle_until)")
+
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS hazard_reports (
+                id INTEGER PRIMARY KEY,
+                latitude TEXT,
+                longitude TEXT,
+                street_name TEXT,
+                vehicle_type TEXT,
+                destination TEXT,
+                result TEXT,
+                cpu_usage TEXT,
+                ram_usage TEXT,
+                quantum_results TEXT,
+                user_id INTEGER,
+                timestamp TEXT,
+                risk_level TEXT,
+                model_used TEXT,
+                FOREIGN KEY (user_id) REFERENCES users(id)
+            )
+        """)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS config (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            )
+        """)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS audit_log (
+                id INTEGER PRIMARY KEY,
+                ts INTEGER NOT NULL,
+                actor TEXT,
+                action TEXT NOT NULL,
+                target TEXT,
+                meta TEXT
+            )
+        """)
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_audit_ts ON audit_log(ts)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_audit_actor ON audit_log(actor)")
+
+        cursor.execute("""
+    CREATE TABLE IF NOT EXISTS user_query_events (
+        id INTEGER PRIMARY KEY,
+        username TEXT NOT NULL,
+        kind TEXT NOT NULL,
+        ts INTEGER NOT NULL
+    )
+""")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_uqe_user_ts ON user_query_events(username, ts)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_uqe_ts ON user_query_events(ts)")
+
+        cursor.execute("""
+    CREATE TABLE IF NOT EXISTS user_usage_daily (
+        username TEXT NOT NULL,
+        day TEXT NOT NULL,
+        count INTEGER NOT NULL DEFAULT 0,
+        PRIMARY KEY (username, day)
+    )
+""")
+
+        cursor.execute("""
+    CREATE TABLE IF NOT EXISTS orgs (
+        id INTEGER PRIMARY KEY,
+        name TEXT UNIQUE NOT NULL,
+        owner_username TEXT NOT NULL,
+        created_ts INTEGER NOT NULL
+    )
+""")
+        cursor.execute("""
+    CREATE TABLE IF NOT EXISTS org_members (
+        org_id INTEGER NOT NULL,
+        username TEXT NOT NULL,
+        role TEXT NOT NULL DEFAULT 'member',
+        joined_ts INTEGER NOT NULL,
+        PRIMARY KEY (org_id, username),
+        FOREIGN KEY (org_id) REFERENCES orgs(id) ON DELETE CASCADE
+    )
+""")
+        cursor.execute("""
+    CREATE TABLE IF NOT EXISTS org_invites (
+        id INTEGER PRIMARY KEY,
+        org_id INTEGER NOT NULL,
+        email TEXT NOT NULL,
+        token TEXT UNIQUE NOT NULL,
+        invited_by TEXT NOT NULL,
+        created_ts INTEGER NOT NULL,
+        expires_ts INTEGER NOT NULL,
+        accepted_ts INTEGER,
+        accepted_username TEXT,
+        FOREIGN KEY (org_id) REFERENCES orgs(id) ON DELETE CASCADE
+    )
+""")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_org_invites_email ON org_invites(email)")
+
+        # User alert subscriptions (weather + risk digests)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS user_alerts (
+                id INTEGER PRIMARY KEY,
+                user_id INTEGER NOT NULL,
+                kind TEXT NOT NULL,
+                lat REAL,
+                lon REAL,
+                enabled INTEGER NOT NULL DEFAULT 1,
+                cadence TEXT NOT NULL DEFAULT 'daily',
+                last_sent_ts INTEGER,
+                created_ts INTEGER NOT NULL,
+                UNIQUE(user_id, kind),
+                FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+            )
+        """)
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_user_alerts_enabled ON user_alerts(enabled)")
+
+        # Anomaly tracking (lightweight)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS user_anomalies (
+                id INTEGER PRIMARY KEY,
+                ts INTEGER NOT NULL,
+                username TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                score REAL NOT NULL,
+                meta TEXT
+            )
+        """)
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_user_anom_ts ON user_anomalies(ts)")
+        cursor.execute("SELECT value FROM config WHERE key = 'registration_enabled'")
+        if not cursor.fetchone():
+            cursor.execute("INSERT INTO config (key, value) VALUES (?, ?)", ('registration_enabled', '1'))
+        # API keys, usage, nonces, and password reset tokens
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS api_keys (
+                id INTEGER PRIMARY KEY,
+                user_id INTEGER NOT NULL,
+                key_id TEXT UNIQUE NOT NULL,
+                secret_encrypted TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                revoked INTEGER DEFAULT 0,
+                last_used_at TEXT,
+                FOREIGN KEY (user_id) REFERENCES users(id)
+            )
+        """)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS api_usage (
+                id INTEGER PRIMARY KEY,
+                user_id INTEGER NOT NULL,
+                day TEXT NOT NULL,
+                used_today INTEGER NOT NULL DEFAULT 0,
+                total_used INTEGER NOT NULL DEFAULT 0,
+                UNIQUE(user_id, day),
+                FOREIGN KEY (user_id) REFERENCES users(id)
+            )
+        """)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS api_nonces (
+                id INTEGER PRIMARY KEY,
+                key_id TEXT NOT NULL,
+                nonce TEXT NOT NULL,
+                ts INTEGER NOT NULL,
+                UNIQUE(key_id, nonce)
+            )
+        """)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS password_reset_tokens (
+                id INTEGER PRIMARY KEY,
+                user_id INTEGER NOT NULL,
+                token_hash TEXT NOT NULL,
+                expires_at INTEGER NOT NULL,
+                used INTEGER DEFAULT 0,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY (user_id) REFERENCES users(id)
+            )
+        """)
+        
+        # API response cache (per-endpoint) + billing/subscriptions (Stripe)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS api_cache (
+                id INTEGER PRIMARY KEY,
+                user_id INTEGER,
+                key_id TEXT,
+                endpoint TEXT NOT NULL,
+                cache_key TEXT NOT NULL,
+                response_json TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                expires_at INTEGER NOT NULL,
+                UNIQUE(endpoint, cache_key)
+            )
+        """)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS stripe_customers (
+                id INTEGER PRIMARY KEY,
+                user_id INTEGER UNIQUE NOT NULL,
+                stripe_customer_id TEXT UNIQUE NOT NULL,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY (user_id) REFERENCES users(id)
+            )
+        """)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS subscriptions (
+                id INTEGER PRIMARY KEY,
+                user_id INTEGER NOT NULL,
+                plan TEXT NOT NULL, -- 'free', 'pro', 'corp'
+                status TEXT NOT NULL, -- 'active', 'trialing', 'past_due', 'canceled'
+                stripe_customer_id TEXT,
+                stripe_subscription_id TEXT UNIQUE,
+                seats INTEGER DEFAULT 1,
+                current_period_end INTEGER DEFAULT 0,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE(user_id, plan),
+                FOREIGN KEY (user_id) REFERENCES users(id)
+            )
+        """)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS credit_purchases (
+                id INTEGER PRIMARY KEY,
+                user_id INTEGER NOT NULL,
+                stripe_payment_intent_id TEXT UNIQUE,
+                stripe_checkout_session_id TEXT UNIQUE,
+                credits INTEGER NOT NULL,
+                amount_cents INTEGER NOT NULL,
+                currency TEXT NOT NULL,
+                status TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY (user_id) REFERENCES users(id)
+            )
+        """)
+        cursor.execute("PRAGMA table_info(hazard_reports)")
+        existing = {row[1] for row in cursor.fetchall()}
+        alter_map = {
+            "latitude":       "ALTER TABLE hazard_reports ADD COLUMN latitude TEXT",
+            "longitude":      "ALTER TABLE hazard_reports ADD COLUMN longitude TEXT",
+            "street_name":    "ALTER TABLE hazard_reports ADD COLUMN street_name TEXT",
+            "vehicle_type":   "ALTER TABLE hazard_reports ADD COLUMN vehicle_type TEXT",
+            "destination":    "ALTER TABLE hazard_reports ADD COLUMN destination TEXT",
+            "result":         "ALTER TABLE hazard_reports ADD COLUMN result TEXT",
+            "cpu_usage":      "ALTER TABLE hazard_reports ADD COLUMN cpu_usage TEXT",
+            "ram_usage":      "ALTER TABLE hazard_reports ADD COLUMN ram_usage TEXT",
+            "quantum_results":"ALTER TABLE hazard_reports ADD COLUMN quantum_results TEXT",
+            "risk_level":     "ALTER TABLE hazard_reports ADD COLUMN risk_level TEXT",
+            "model_used":     "ALTER TABLE hazard_reports ADD COLUMN model_used TEXT",
+        }
+        for col, alter_sql in alter_map.items():
+            if col not in existing:
+                cursor.execute(alter_sql)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS rate_limits (
+                user_id INTEGER,
+                request_count INTEGER DEFAULT 0,
+                last_request_time TEXT,
+                FOREIGN KEY (user_id) REFERENCES users(id)
+            )
+        """)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS invite_codes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                code TEXT UNIQUE NOT NULL,
+                is_used BOOLEAN DEFAULT 0
+            )
+        """)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS entropy_logs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                pass_num INTEGER NOT NULL,
+                log TEXT NOT NULL,
+                timestamp TEXT DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS blog_posts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                slug TEXT UNIQUE NOT NULL,
+                title_enc TEXT NOT NULL,
+                content_enc TEXT NOT NULL,
+                summary_enc TEXT,
+                tags_enc TEXT,
+                status TEXT NOT NULL DEFAULT 'draft',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                author_id INTEGER NOT NULL,
+                sig_alg TEXT,
+                sig_pub_fp8 TEXT,
+                sig_val BLOB,
+                FOREIGN KEY (author_id) REFERENCES users(id)
+            )
+        """)
+
+      
+        cursor.execute("PRAGMA table_info(blog_posts)")
+        blog_cols = {row[1] for row in cursor.fetchall()}
+        blog_alters = {
+            
+            "summary_enc": "ALTER TABLE blog_posts ADD COLUMN summary_enc TEXT",
+            "tags_enc": "ALTER TABLE blog_posts ADD COLUMN tags_enc TEXT",
+            
+            "sig_alg": "ALTER TABLE blog_posts ADD COLUMN sig_alg TEXT",
+            "sig_pub_fp8": "ALTER TABLE blog_posts ADD COLUMN sig_pub_fp8 TEXT",
+            "sig_val": "ALTER TABLE blog_posts ADD COLUMN sig_val BLOB",
+            
+            "featured": "ALTER TABLE blog_posts ADD COLUMN featured INTEGER NOT NULL DEFAULT 0",
+            "featured_rank": "ALTER TABLE blog_posts ADD COLUMN featured_rank INTEGER NOT NULL DEFAULT 0",
+        }
+        for col, alter_sql in blog_alters.items():
+            if col not in blog_cols:
+                cursor.execute(alter_sql)
+
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_blog_status_created ON blog_posts (status, created_at DESC)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_blog_updated ON blog_posts (updated_at DESC)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_blog_featured ON blog_posts (featured, featured_rank DESC, created_at DESC)")
+
+        # Corporate workspaces (org-like accounts)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS corporate_accounts (
+                id INTEGER PRIMARY KEY,
+                owner_user_id INTEGER NOT NULL,
+                name TEXT,
+                seats INTEGER DEFAULT 5,
+                stripe_customer_id TEXT,
+                stripe_subscription_id TEXT,
+                created_at TEXT,
+                FOREIGN KEY(owner_user_id) REFERENCES users(id)
+            )
+        """)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS corporate_members (
+                corporate_id INTEGER NOT NULL,
+                user_id INTEGER NOT NULL,
+                role TEXT DEFAULT 'member',
+                joined_at TEXT,
+                PRIMARY KEY (corporate_id, user_id),
+                FOREIGN KEY(corporate_id) REFERENCES corporate_accounts(id),
+                FOREIGN KEY(user_id) REFERENCES users(id)
+            )
+        """)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS corporate_invites (
+                id INTEGER PRIMARY KEY,
+                corporate_id INTEGER NOT NULL,
+                email TEXT NOT NULL,
+                token_hash TEXT NOT NULL,
+                expires_at INTEGER NOT NULL,
+                accepted_at TEXT,
+                created_at TEXT,
+                created_by_user_id INTEGER,
+                FOREIGN KEY(corporate_id) REFERENCES corporate_accounts(id),
+                FOREIGN KEY(created_by_user_id) REFERENCES users(id)
+            )
+        """)
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_corp_invites_email ON corporate_invites(email)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_corp_members_user ON corporate_members(user_id)")
+
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS stripe_events_processed (
+                event_id TEXT PRIMARY KEY,
+                event_type TEXT,
+                created_at TEXT
+            )
+        """)
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_stripe_events_type ON stripe_events_processed(event_type)")
+
+        db.commit()
+    print("Database tables created and verified successfully.")
+
+class BlogForm(FlaskForm):
+    title = StringField('Title', validators=[DataRequired(), Length(min=1, max=160)])
+    slug = StringField('Slug', validators=[Length(min=3, max=80)])
+    summary = TextAreaField('Summary', validators=[Length(max=5000)])
+    content = TextAreaField('Content', validators=[DataRequired(), Length(min=1, max=200000)])
+    tags = StringField('Tags', validators=[Length(max=500)])
+    status = SelectField('Status', choices=[('draft', 'Draft'), ('published', 'Published'), ('archived', 'Archived')], validators=[DataRequired()])
+    submit = SubmitField('Save')
+
+_SLUG_RE = re.compile(r'^[a-z0-9]+(?:-[a-z0-9]+)*$')
+
+def _slugify(title: str) -> str:
+    base = re.sub(r'[^a-zA-Z0-9\s-]', '', (title or '')).strip().lower()
+    base = re.sub(r'\s+', '-', base)
+    base = re.sub(r'-{2,}', '-', base).strip('-')
+    if not base:
+        base = secrets.token_hex(4)
+    return base[:80]
+    
+def _valid_slug(slug: str) -> bool:
+    return bool(_SLUG_RE.fullmatch(slug or ''))
+    
+_ALLOWED_TAGS = set(bleach.sanitizer.ALLOWED_TAGS) | {
+    'p','h1','h2','h3','h4','h5','h6','ul','ol','li','strong','em','blockquote','code','pre',
+    'a','img','hr','br','table','thead','tbody','tr','th','td','span'
+}
+_ALLOWED_ATTRS = {
+    **bleach.sanitizer.ALLOWED_ATTRIBUTES,
+    'a': ['href','title','rel','target'],
+    'img': ['src','alt','title','width','height','loading','decoding'],
+    'span': ['class','data-emoji'],
+    'code': ['class'],
+    'pre': ['class'],
+    'th': ['colspan','rowspan'],
+    'td': ['colspan','rowspan']
+}
+_ALLOWED_PROTOCOLS = ['http','https','mailto','data']
+
+def _link_cb_rel_and_target(attrs, new):
+    if (None, 'href') not in attrs:
+        return attrs
+    rel_key = (None, 'rel')
+    rel_tokens = set((attrs.get(rel_key, '') or '').split())
+    rel_tokens.update({'nofollow', 'noopener', 'noreferrer'})
+    attrs[rel_key] = ' '.join(sorted(t for t in rel_tokens if t))
+    attrs[(None, 'target')] = '_blank'
+    return attrs
+
+def sanitize_html(html: str) -> str:
+    html = html or ""
+    html = bleach.clean(
+        html,
+        tags=_ALLOWED_TAGS,
+        attributes=_ALLOWED_ATTRS,
+        protocols=_ALLOWED_PROTOCOLS,
+        strip=True,
+    )
+    html = bleach.linkify(
+        html,
+        callbacks=[_link_cb_rel_and_target],
+        skip_tags=['code','pre'],
+    )
+    return html
+
+def sanitize_text(s: str, max_len: int) -> str:
+    s = bleach.clean(s or "", tags=[], attributes={}, protocols=_ALLOWED_PROTOCOLS, strip=True, strip_comments=True)
+    s = re.sub(r'\s+', ' ', s).strip()
+    return s[:max_len]
+    
+def sanitize_tags_csv(raw: str, max_tags: int = 50) -> str:
+    parts = [sanitize_text(p, 40) for p in (raw or "").split(",")]
+    parts = [p for p in parts if p]
+    out = ",".join(parts[:max_tags])
+    return out[:500]
+    
+def _blog_ctx(field: str, rid: Optional[int] = None) -> dict:
+    return build_hd_ctx(domain="blog", field=field, rid=rid)
+    
+def blog_encrypt(field: str, plaintext: str, rid: Optional[int] = None) -> str:
+    return encrypt_data(plaintext or "", ctx=_blog_ctx(field, rid))
+    
+def blog_decrypt(ciphertext: Optional[str]) -> str:
+    if not ciphertext: return ""
+    return decrypt_data(ciphertext) or ""
+    
+def _post_sig_payload(slug: str, title_html: str, content_html: str, summary_html: str, tags_csv: str, status: str, created_at: str, updated_at: str) -> bytes:
+    return _canon_json({
+        "v":"blog1",
+        "slug": slug,
+        "title_html": title_html,
+        "content_html": content_html,
+        "summary_html": summary_html,
+        "tags_csv": tags_csv,
+        "status": status,
+        "created_at": created_at,
+        "updated_at": updated_at
+    })
+def _sign_post(payload: bytes) -> tuple[str, str, bytes]:
+    alg = key_manager.sig_alg_name or "Ed25519"
+    sig = key_manager.sign_blob(payload)
+    pub = getattr(key_manager, "sig_pub", None) or b""
+    return alg, _fp8(pub), sig
+    
+def _verify_post(payload: bytes, sig_alg: str, sig_pub_fp8: str, sig_val: bytes) -> bool:
+    # Pass 12: verify using a persisted signing public key keyed by fp8 to survive key rotations/restarts.
+    pub = getattr(key_manager, "sig_pub", None) or b""
+    if pub and _fp8(pub) == (sig_pub_fp8 or ""):
+        return key_manager.verify_blob(pub, sig_val, payload)
+
+    with db_connect(DB_FILE) as db:
+        cursor = db.cursor()
+        cursor.execute(
+            "SELECT id, password, is_admin FROM users WHERE username = ?",
+            (admin_user, ))
+        row = cursor.fetchone()
+
+
+        # -----------------------------
+        # Usage tracking / banning / plan gating
+
+        # In-memory, thread-safe sliding-window limiter.
+_RATE_LOCK = threading.Lock()
+_RATE_BUCKETS: dict[str, deque] = {}
+
+def rate_limiter_allow(key: str, limit: int, window_seconds: int) -> tuple[bool, str]:
+    if limit <= 0:
+        return True, ""
+    now = time.time()
+    cutoff = now - float(window_seconds)
+    with _RATE_LOCK:
+        dq = _RATE_BUCKETS.get(key)
+        if dq is None:
+            dq = deque()
+            _RATE_BUCKETS[key] = dq
+        while dq and dq[0] < cutoff:
+            dq.popleft()
+        if len(dq) >= int(limit):
+            return False, "rate_limited"
+        dq.append(now)
+    return True, ""
+
+        # -----------------------------
+
+def _now_ts() -> int:
+    return int(time.time())
+
+def _user_plan(username: str) -> str:
+    try:
+        with db_connect(DB_FILE) as db:
+            cur = db.cursor()
+            cur.execute("SELECT COALESCE(plan,'free') FROM users WHERE username = ?", (username,))
+            row = cur.fetchone()
+            return (row[0] if row and row[0] else "free")
+    except Exception:
+        return "free"
+
+def _is_paid_plan(plan: str) -> bool:
+    return str(plan).lower() in ("pro", "corp", "corporate")
+
+def _user_is_banned(username: str) -> tuple[bool, str]:
+    """Returns (is_banned, reason)."""
+    if not username:
+        return False, ""
+
+    with db_connect(DB_FILE) as db:
+        cursor = db.cursor()
+        cursor.execute("SELECT COUNT(*) FROM users WHERE is_admin = 1")
+        admins = cursor.fetchone()[0]
+
+def _maybe_flag_anomaly(username: str) -> None:
+    """Lightweight abuse detection. Flags spikes and applies temporary throttles."""
+    if not username:
+        return
+    plan = _user_plan(username)
+    now = _now_ts()
+    # thresholds are conservative defaults; adjust via env.
+    if str(plan).lower() in ("corp", "corporate"):
+        threshold = int(os.getenv("ANOM_CORP_PER_HOUR", "2000"))
+        throttle_seconds = int(os.getenv("ANOM_CORP_THROTTLE_SECONDS", "0"))
+    elif str(plan).lower() == "pro":
+        threshold = int(os.getenv("ANOM_PRO_PER_HOUR", "800"))
+        throttle_seconds = int(os.getenv("ANOM_PRO_THROTTLE_SECONDS", "180"))
+    else:
+        threshold = int(os.getenv("ANOM_FREE_PER_HOUR", "200"))
+        throttle_seconds = int(os.getenv("ANOM_FREE_THROTTLE_SECONDS", "900"))
+
+    ensure_admin_from_env()
+
+    with db_connect(DB_FILE) as db:
+        cursor = db.cursor()
+        cursor.execute("SELECT COUNT(*) FROM users WHERE is_admin = 1")
+        admins = cursor.fetchone()[0]
+
+    if admins == 0:
+        logger.critical(
+            "No admin exists and env admin credentials not provided/valid. Halting."
+        )
+        import sys
+        sys.exit("FATAL: No admin account present.")
+
+create_tables()
+
+_init_done = False
+_init_lock = threading.Lock()
+
+def record_user_query(username: str, kind: str) -> None:
+    if not username:
+        return
+    ts = _now_ts()
+    day = datetime.utcfromtimestamp(ts).strftime("%Y-%m-%d")
+    try:
+        with db_connect(DB_FILE) as db:
+            cur = db.cursor()
+            cur.execute("INSERT INTO user_query_events (username, kind, ts) VALUES (?, ?, ?)", (username, kind or "unknown", ts))
+            cur.execute(
+                "INSERT INTO user_usage_daily (username, day, count) VALUES (?, ?, 1) "
+                "ON CONFLICT(username, day) DO UPDATE SET count = count + 1",
+                (username, day),
+            )
+            db.commit()
+        # Run anomaly detector out of transaction.
+        _maybe_flag_anomaly(username)
+    except Exception:
+        logger.exception("Failed to record user query")
+
+def get_user_query_stats(username: str) -> dict[str, int]:
+    ts = _now_ts()
+    t24 = ts - 24 * 3600
+    t72 = ts - 72 * 3600
+    try:
+        with db_connect(DB_FILE) as db:
+            cur = db.cursor()
+            cur.execute("SELECT COUNT(*) FROM user_query_events WHERE username = ? AND ts >= ?", (username, t24))
+            c24 = int(cur.fetchone()[0] or 0)
+            cur.execute("SELECT COUNT(*) FROM user_query_events WHERE username = ? AND ts >= ?", (username, t72))
+            c72 = int(cur.fetchone()[0] or 0)
+            cur.execute("SELECT COUNT(*) FROM user_query_events WHERE username = ?", (username,))
+            call = int(cur.fetchone()[0] or 0)
+            return {"count_24h": c24, "count_72h": c72, "count_all": call}
+    except Exception:
+        logger.exception("Failed to compute query stats")
+        return {"count_24h": 0, "count_72h": 0, "count_all": 0}
+
+def _rate_policy_for_user(username: str) -> dict[str, int]:
+    plan = _user_plan(username)
+    if str(plan).lower() in ("corp", "corporate"):
+        return {"per_minute": int(os.getenv("RATE_CORP_PER_MIN", "300")), "per_day": int(os.getenv("RATE_CORP_PER_DAY", "20000"))}
+    if str(plan).lower() == "pro":
+        return {"per_minute": int(os.getenv("RATE_PRO_PER_MIN", "120")), "per_day": int(os.getenv("RATE_PRO_PER_DAY", "5000"))}
+    return {"per_minute": int(os.getenv("RATE_FREE_PER_MIN", "30")), "per_day": int(os.getenv("RATE_FREE_PER_DAY", "500"))}
+
+def _enforce_user_rate_limits(username: str, kind: str) -> tuple[bool, str]:
+    """
+    Enforces per-minute (in-memory) and per-day (sqlite) limits.
+    Paid users get higher limits.
+    """
+    if not username:
+        return False, "not_authenticated"
+
+    throttle_until = _user_throttle_until(username)
+    if throttle_until:
+        return False, "temporarily_throttled"
+
+    # per-minute (in-memory, best-effort)
+    policy = _rate_policy_for_user(username)
+    per_min = int(policy["per_minute"])
+    key = f"u:{username}:{kind}:min"
+    ok, err = rate_limiter_allow(key, per_min, 60)
+    if not ok:
+        return False, "rate_limited_minute"
+
+with app.app_context():
+    init_app_once()
+def is_registration_enabled():
+    val = os.getenv('REGISTRATION_ENABLED', 'false')
+    enabled = str(val).strip().lower() in ('1', 'true', 'yes', 'on')
+    logger.debug(f"[ENV] Registration enabled: {enabled} (REGISTRATION_ENABLED={val!r})")
+    return enabled
+
+def set_registration_enabled(enabled: bool, admin_user_id: int):
+    os.environ['REGISTRATION_ENABLED'] = 'true' if enabled else 'false'
+    logger.debug(
+        f"[ENV] Admin user_id {admin_user_id} set REGISTRATION_ENABLED={os.environ['REGISTRATION_ENABLED']}"
+    )
+
 def blog_list_featured(limit: int = 6) -> list[dict]:
    
     with db_connect(DB_FILE) as db:
@@ -4814,19 +7084,11 @@ def blog_list_home(limit: int = 3) -> list[dict]:
         pass
     return blog_list_published(limit=limit, offset=0)
 
-def blog_set_featured(post_id: int, featured: bool, featured_rank: int = 0) -> bool:
-    try:
-        with db_connect(DB_FILE) as db:
-            cur = db.cursor()
-            cur.execute(
-                "UPDATE blog_posts SET featured=?, featured_rank=? WHERE id=?",
-                (1 if featured else 0, int(featured_rank or 0), int(post_id)),
-            )
-            db.commit()
-        audit.append(
-            "blog_featured_set",
-            {"id": int(post_id), "featured": bool(featured), "featured_rank": int(featured_rank or 0)},
-            actor=session.get("username") or "admin",
+def fetch_entropy_logs():
+    with db_connect(DB_FILE) as db:
+        cursor = db.cursor()
+        cursor.execute(
+            "SELECT encrypted_data, description, timestamp FROM entropy_logs ORDER BY id"
         )
         return True
     except Exception as e:
@@ -4921,17 +7183,67 @@ def blog_save(
     created_at = now
     existing = False
 
+@app.get('/healthz')
+def healthz():
+    return "ok", 200
+
+def delete_expired_data():
+    import re
+    def _regexp(pattern, item):
+        if item is None:
+            return 0
+        return 1 if re.search(pattern, item) else 0
+    while True:
+        expiration_str = (datetime.utcnow() - timedelta(hours=EXPIRATION_HOURS)).strftime("%Y-%m-%d %H:%M:%S")
+        try:
+            with db_connect(DB_FILE) as db:
+                db.row_factory = sqlite3.Row
+                db.create_function("REGEXP", 2, _regexp)
+                cur = db.cursor()
+                cur.execute("BEGIN IMMEDIATE")
+                cur.execute("PRAGMA table_info(hazard_reports)")
+                hazard_cols = {r["name"] for r in cur.fetchall()}
+                required = {"latitude","longitude","street_name","vehicle_type","destination","result","cpu_usage","ram_usage","quantum_results","risk_level","timestamp"}
+                if required.issubset(hazard_cols):
+                    cur.execute("SELECT id FROM hazard_reports WHERE timestamp<=?", (expiration_str,))
+                    ids = [r["id"] for r in cur.fetchall()]
+                    overwrite_hazard_reports_by_timestamp(cur, expiration_str, passes=7)
+                    cur.execute("DELETE FROM hazard_reports WHERE timestamp<=?", (expiration_str,))
+                    logger.debug("hazard_reports purged: %s", ids)
+                else:
+                    logger.warning("hazard_reports skipped - missing columns: %s", required - hazard_cols)
+                cur.execute("PRAGMA table_info(entropy_logs)")
+                entropy_cols = {r["name"] for r in cur.fetchall()}
+                req_e = {"id","log","pass_num","timestamp"}
+                if req_e.issubset(entropy_cols):
+                    cur.execute("SELECT id FROM entropy_logs WHERE timestamp<=?", (expiration_str,))
+                    ids = [r["id"] for r in cur.fetchall()]
+                    overwrite_entropy_logs_by_timestamp(cur, expiration_str, passes=7)
+                    cur.execute("DELETE FROM entropy_logs WHERE timestamp<=?", (expiration_str,))
+                    logger.debug("entropy_logs purged: %s", ids)
+                else:
+                    logger.warning("entropy_logs skipped - missing columns: %s", req_e - entropy_cols)
+                db.commit()
+            try:
+                with db_connect(DB_FILE) as db:
+                    db.create_function("REGEXP", 2, _regexp)
+                    for _ in range(3):
+                        db.execute("VACUUM")
+                logger.debug("Database triple VACUUM completed.")
+            except sqlite3.OperationalError as e:
+                logger.error("VACUUM failed: %s", e, exc_info=True)
+        except Exception as e:
+            logger.error("delete_expired_data failed: %s", e, exc_info=True)
+        time.sleep(random.randint(5400, 10800))
+
+def delete_user_data(user_id):
     try:
         with db_connect(DB_FILE) as db:
-            cur = db.cursor()
-            if post_id:
-                cur.execute("SELECT created_at FROM blog_posts WHERE id=? LIMIT 1", (int(post_id),))
-                row = cur.fetchone()
-                if row:
-                    created_at = row[0]
-                    existing = True
-                else:
-                    existing = False
+            cursor = db.cursor()
+            db.execute("BEGIN")
+
+            overwrite_hazard_reports_by_user(cursor, user_id, passes=7)
+            cursor.execute("DELETE FROM hazard_reports WHERE user_id = ?", (user_id, ))
 
             def _slug_exists_local(s: str) -> bool:
                 if post_id:
@@ -4984,8 +7296,59 @@ def blog_save(
                 audit.append("blog_create", {"id": int(new_id), "slug": slug, "status": status}, actor=session.get("username") or "admin")
                 return True, "Created", int(new_id), slug
     except Exception as e:
-        logger.error(f"blog_save failed: {e}", exc_info=True)
-        return False, "DB error", None, None
+        db.rollback()
+        logger.error(
+            f"Failed to securely delete data for user_id {user_id}: {e}",
+            exc_info=True)
+
+def sanitize_input(user_input):
+    if not isinstance(user_input, str):
+        user_input = str(user_input)
+    return bleach.clean(user_input)
+
+gc = geonamescache.GeonamesCache()
+cities = gc.get_cities()
+
+def _stable_seed(s: str) -> int:
+    h = hashlib.sha256(s.encode("utf-8")).hexdigest()
+    return int(h[:8], 16)
+
+def _user_id():
+    return session.get("username") or getattr(request, "_qrs_uid", "anon")
+
+@app.before_request
+def ensure_fp():
+    if request.endpoint == 'static':
+        return
+    fp = request.cookies.get('qrs_fp')
+    if not fp:
+        uid = (session.get('username') or os.urandom(6).hex())
+        fp = format(_stable_seed(uid), 'x')
+        resp = make_response()
+        request._qrs_fp_to_set = fp
+        request._qrs_uid = uid
+    else:
+        request._qrs_uid = fp
+
+def _attach_cookie(resp):
+    fp = getattr(request, "_qrs_fp_to_set", None)
+    if fp:
+        resp.set_cookie("qrs_fp", fp, samesite="Lax", max_age=60*60*24*365)
+    return resp
+
+def _safe_json_parse(txt: str):
+    try:
+        return json.loads(txt)
+    except Exception:
+        try:
+            s = txt.find("{"); e = txt.rfind("}")
+            if s >= 0 and e > s:
+                return json.loads(txt[s:e+1])
+        except Exception:
+            return None
+    return None
+
+_QML_OK = False
 
 def blog_delete(post_id: int) -> bool:
     try:
@@ -6420,6 +8783,767 @@ def _alerts_dispatch_allowed() -> bool:
     return False
 
 
+    for attempt in range(3):
+        try:
+            r = client.post(_GROK_CHAT_PATH, json=payload)
+            if r.status_code in (429, 500, 502, 503, 504):
+                time.sleep(1.0 * (2 ** attempt))
+                continue
+            r.raise_for_status()
+            data = r.json()
+            content = data.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
+            return _safe_json_parse(_sanitize(content))
+        except Exception as e:
+            logger.debug(f"Grok sync attempt {attempt+1} failed: {e}")
+            time.sleep(0.5)
+
+    return None
+
+@app.route("/api/theme/personalize", methods=["GET"])
+def api_theme_personalize():
+    uid = _user_id()
+    seed = colorsync.sample(uid)
+    return jsonify({"hex": seed.get("hex", "#49c2ff"), "code": seed.get("qid25",{}).get("code","B2")})
+
+@app.route("/api/risk/llm_route", methods=["POST"])
+def api_llm_route():
+    if "username" not in session:
+        return jsonify({"error": "Login required"}), 401
+    uid = _user_id()
+    body = request.get_json(force=True, silent=True) or {}
+    try:
+        route = {
+            "lat": float(body["lat"]), "lon": float(body["lon"]),
+            "dest_lat": float(body["dest_lat"]), "dest_lon": float(body["dest_lon"]),
+        }
+    except Exception:
+        return jsonify({"error":"lat, lon, dest_lat, dest_lon required"}), 400
+
+    sig = _system_signals(uid)
+    prompt = _build_route_prompt(uid, sig, route)
+    data = _call_llm(prompt) or _fallback_score(sig, route)
+    data["server_enriched"] = {"ts": datetime.utcnow().isoformat()+"Z","mode":"route","sig": sig,"route": route}
+    return _attach_cookie(jsonify(data))
+    
+@app.route("/api/risk/stream")
+def api_stream():
+    if "username" not in session:
+        return jsonify({"error": "Login required"}), 401
+
+    uid = _user_id()
+
+    @stream_with_context
+    def gen():
+        for _ in range(24):
+            sig = _system_signals(uid)
+            prompt = _build_guess_prompt(uid, sig)
+            data = _call_llm(prompt)  # no local fallback
+
+@app.route('/admin/blog/backup', methods=['GET'])
+
+        # -----------------------------
+        # Admin: Central console (users, billing, llama manager, blog tools)
+        # -----------------------------
+
+@app.route("/admin", methods=["GET"])
+def admin_console():
+    guard = _require_admin()
+    if guard:
+        return guard
+
+    csrf_token = generate_csrf()
+    with db_connect(DB_FILE) as db:
+        cur = db.cursor()
+        cur.execute("SELECT username, COALESCE(email,''), COALESCE(plan,'free'), COALESCE(is_admin,0), COALESCE(is_banned,0), banned_until, COALESCE(banned_reason,'') FROM users ORDER BY is_admin DESC, username ASC LIMIT 200")
+        rows = cur.fetchall()
+
+    users = []
+    for r in rows:
+        uname = r[0]
+        stats = get_user_query_stats(uname)
+        users.append({
+            "username": uname,
+            "email": r[1] or "",
+            "plan": r[2] or "free",
+            "is_admin": bool(r[3]),
+            "is_banned": bool(r[4]),
+            "banned_until": r[5],
+            "banned_reason": r[6] or "",
+            "c24": stats["count_24h"],
+            "c72": stats["count_72h"],
+            "call": stats["count_all"],
+        })
+
+    stripe_enabled = str(os.getenv("STRIPE_ENABLED", "false")).lower() in ("1", "true", "yes", "on")
+
+    usage_series = usage_series_days(14)
+    with db_connect(DB_FILE) as db:
+        cur = db.cursor()
+        cache_row = cur.execute("SELECT COUNT(*), COALESCE(SUM(LENGTH(response_json)),0) FROM api_cache").fetchone()
+        cache_stats = {"entries": int(cache_row[0] or 0), "bytes": int(cache_row[1] or 0)}
+        audits = cur.execute("SELECT ts, actor, action, target, meta FROM audit_log ORDER BY ts DESC LIMIT 60").fetchall()
+        flags = {
+            "MAINTENANCE_MODE": get_feature_flag(db, "MAINTENANCE_MODE", "false"),
+            "SCAN_ENABLED": get_feature_flag(db, "SCAN_ENABLED", "true"),
+            "WEATHER_ENABLED": get_feature_flag(db, "WEATHER_ENABLED", "true"),
+            "API_ENABLED": get_feature_flag(db, "API_ENABLED", "true"),
+            "REGISTRATION_ENABLED": get_feature_flag(db, "REGISTRATION_ENABLED", "true"),
+        }
+        # top users last 24h
+        top24 = cur.execute(
+            "SELECT username, COUNT(*) c FROM user_query_events WHERE ts >= ? GROUP BY username ORDER BY c DESC LIMIT 8",
+            (_now_ts() - 24*3600,),
+        ).fetchall()
+
+    return render_template_string("""
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Admin - QRoadScan</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="csrf-token" content="{{ csrf_token }}">
+  <link rel="stylesheet" href="{{ url_for('static', filename='css/bootstrap.min.css') }}">
+  <style>
+    :root{
+      --bg0:#070c18; --bg1:#0b1328;
+      --card:rgba(255,255,255,.06); --card2:rgba(255,255,255,.09);
+      --stroke:rgba(255,255,255,.12);
+      --text:#eef3ff; --mut:rgba(238,243,255,.72);
+      --a1:#60a5fa; --a2:#a78bfa;
+      --good:#2dd4bf; --warn:#fbbf24; --bad:#fb7185;
+      --r:18px; --shadow:0 18px 48px rgba(0,0,0,.55);
+    }
+    html,body{height:100%}
+    body{
+      margin:0; color:var(--text);
+      background: radial-gradient(1100px 650px at 15% 8%, rgba(96,165,250,.20), transparent 55%),
+                  radial-gradient(900px 620px at 82% 10%, rgba(167,139,250,.18), transparent 55%),
+                  linear-gradient(180deg, var(--bg0), var(--bg1));
+      font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Arial;
+    }
+    .wrap{max-width:1280px;margin:0 auto;padding:18px 14px 46px}
+    .hero{
+      display:flex; gap:12px; align-items:flex-start; justify-content:space-between; flex-wrap:wrap;
+      padding:16px 16px; border:1px solid var(--stroke); border-radius:var(--r);
+      background:linear-gradient(180deg, rgba(255,255,255,.08), rgba(255,255,255,.04));
+      box-shadow:var(--shadow);
+    }
+    .hero h1{font-size:18px;margin:0 0 6px;letter-spacing:.2px}
+    .hero .sub{color:var(--mut);font-size:13px;margin:0}
+    .pill{
+      display:inline-flex; align-items:center; gap:8px;
+      padding:8px 10px; border:1px solid var(--stroke); border-radius:999px;
+      background:rgba(0,0,0,.20); color:var(--mut); font-size:12px;
+      white-space:nowrap;
+    }
+    .pill strong{color:var(--text); font-weight:700}
+    .grid{
+      margin-top:14px;
+      display:grid; gap:12px;
+      grid-template-columns: 1fr;
+    }
+    @media(min-width:992px){
+      .grid{grid-template-columns: 1.5fr 1fr;}
+      .wide{grid-column:1/-1;}
+    }
+    .card{
+      border:1px solid var(--stroke); border-radius:var(--r);
+      background:linear-gradient(180deg, rgba(255,255,255,.07), rgba(255,255,255,.04));
+      box-shadow:var(--shadow);
+      overflow:hidden;
+    }
+    .card .hd{
+      padding:12px 14px;
+      display:flex; align-items:center; justify-content:space-between; gap:10px; flex-wrap:wrap;
+      border-bottom:1px solid rgba(255,255,255,.10);
+      background:rgba(0,0,0,.15);
+    }
+    .card .hd h2{font-size:14px;margin:0}
+    .card .bd{padding:12px 14px}
+    .tabs{
+      display:flex; gap:8px; flex-wrap:wrap;
+    }
+    .tabbtn{
+      appearance:none; border:1px solid var(--stroke); background:rgba(0,0,0,.20);
+      color:var(--mut); padding:8px 10px; border-radius:999px; font-size:12px;
+      cursor:pointer; user-select:none;
+      transition:transform .06s ease, background .15s ease, color .15s ease;
+    }
+    .tabbtn.active{
+      color:var(--text);
+      background:linear-gradient(135deg, rgba(96,165,250,.30), rgba(167,139,250,.28));
+      border-color:rgba(255,255,255,.18);
+    }
+    .tabpane{display:none}
+    .tabpane.active{display:block}
+    .mut{color:var(--mut)}
+    .mini{font-size:12px;color:var(--mut)}
+    .table-wrap{overflow:auto;border-radius:14px;border:1px solid rgba(255,255,255,.10)}
+    table{width:100%;border-collapse:collapse}
+    th,td{padding:10px 10px; vertical-align:middle}
+    th{font-size:11px; text-transform:uppercase; letter-spacing:.08em; color:rgba(238,243,255,.70); background:rgba(0,0,0,.22); position:sticky; top:0}
+    tr{border-bottom:1px solid rgba(255,255,255,.08)}
+    tr:last-child{border-bottom:none}
+    input,select,textarea{
+      width:100%; border-radius:12px;
+      border:1px solid rgba(255,255,255,.14);
+      background:rgba(0,0,0,.20);
+      color:var(--text); padding:8px 10px; font-size:13px;
+      outline:none;
+    }
+    textarea{min-height:38px}
+    .btnq{
+      width:100%;
+      appearance:none; border:1px solid rgba(255,255,255,.18);
+      background:linear-gradient(180deg, rgba(255,255,255,.12), rgba(255,255,255,.06));
+      color:var(--text); border-radius:14px;
+      padding:9px 10px; font-weight:700; font-size:13px;
+      text-align:center; cursor:pointer;
+      transition:transform .06s ease, filter .15s ease;
+    }
+    .btnq:hover{filter:brightness(1.05)}
+    .btnq:active{transform:translateY(1px)}
+    .btnq.primary{
+      border-color:rgba(96,165,250,.30);
+      background:linear-gradient(135deg, rgba(96,165,250,.75), rgba(167,139,250,.70));
+    }
+    .btnq.danger{
+      border-color:rgba(251,113,133,.30);
+      background:linear-gradient(135deg, rgba(251,113,133,.65), rgba(244,63,94,.55));
+    }
+    .row2{display:grid; grid-template-columns:1fr; gap:10px}
+    @media(min-width:992px){ .row2{grid-template-columns:1fr 1fr;} }
+    .bars{display:flex; align-items:flex-end; gap:6px; height:72px; padding:10px; border-radius:14px; border:1px solid rgba(255,255,255,.10); background:rgba(0,0,0,.18)}
+    .bar{flex:1; border-radius:10px 10px 6px 6px; background:linear-gradient(180deg, rgba(96,165,250,.85), rgba(167,139,250,.75)); min-width:6px}
+    .kpi{display:flex; gap:10px; flex-wrap:wrap}
+    .kpi .pill{background:rgba(0,0,0,.18)}
+    .split{display:grid;grid-template-columns:1fr;gap:10px}
+    @media(min-width:992px){.split{grid-template-columns:1.1fr .9fr}}
+    .mono{font-family:ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', 'Courier New', monospace}
+    .link{color:var(--text); text-decoration:none}
+    .link:hover{text-decoration:underline}
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="hero">
+      <div>
+        <h1>Admin Console</h1>
+        <p class="sub">Central command: users, billing, cache, models, backups, security.</p>
+      </div>
+      <div class="kpi">
+        <span class="pill"><strong>{{ cache_stats.entries }}</strong> cache entries</span>
+        <span class="pill"><strong>{{ (cache_stats.bytes/1024)|round(1) }}</strong> KB cached</span>
+        <span class="pill">Maintenance: <strong>{{ flags.MAINTENANCE_MODE }}</strong></span>
+        <span class="pill">Scan: <strong>{{ flags.SCAN_ENABLED }}</strong></span>
+        <span class="pill">API: <strong>{{ flags.API_ENABLED }}</strong></span>
+      </div>
+    </div>
+
+    <div class="card" style="margin-top:12px">
+      <div class="hd">
+        <h2>Console</h2>
+        <div class="tabs" id="tabs">
+          <button class="tabbtn active" data-tab="users">Users</button>
+          <button class="tabbtn" data-tab="analytics">Analytics</button>
+          <button class="tabbtn" data-tab="billing">Billing</button>
+          <button class="tabbtn" data-tab="cache">Cache</button>
+          <button class="tabbtn" data-tab="security">Security</button>
+          <button class="tabbtn" data-tab="tools">Tools</button>
+          <button class="tabbtn" data-tab="audit">Audit</button>
+        </div>
+      </div>
+
+      <div class="bd">
+        <!-- USERS -->
+        <section class="tabpane active" id="tab-users">
+          <div class="mini" style="margin-bottom:10px">Manage plans, bans, and API keys. Counts show queries in last 24h / 72h / all-time.</div>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>User</th><th>Email</th><th>Plan</th><th>Usage</th><th>Status</th><th style="min-width:280px">Actions</th>
+                </tr>
+              </thead>
+              <tbody>
+              {% for u in users %}
+                <tr>
+                  <td class="mono">{{ u.username }}</td>
+                  <td class="mono">{{ u.email }}</td>
+                  <td>
+                    <form method="POST" action="{{ url_for('admin_user_update') }}">
+                      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                      <input type="hidden" name="username" value="{{ u.username }}">
+                      <input type="hidden" name="action" value="save">
+                      <select name="plan" onchange="this.form.submit()">
+                        <option value="free" {% if u.plan=='free' %}selected{% endif %}>free</option>
+                        <option value="pro" {% if u.plan=='pro' %}selected{% endif %}>pro</option>
+                        <option value="corp" {% if u.plan in ['corp','corporate'] %}selected{% endif %}>corp</option>
+                      </select>
+                    </form>
+                  </td>
+                  <td class="mono">{{ u.c24 }} / {{ u.c72 }} / {{ u.call }}</td>
+                  <td>
+                    {% if u.is_admin %}<span class="pill"><strong>admin</strong></span>{% endif %}
+                    {% if u.is_banned %}<span class="pill" style="border-color:rgba(251,113,133,.35)">banned</span>{% else %}<span class="pill" style="border-color:rgba(45,212,191,.35)">active</span>{% endif %}
+                  </td>
+                  <td>
+                    <div class="row2">
+                      <form method="POST" action="{{ url_for('admin_user_update') }}">
+                        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                        <input type="hidden" name="username" value="{{ u.username }}">
+                        <input type="hidden" name="plan" value="{{ u.plan }}">
+                        <input type="hidden" name="action" value="ban">
+                        <div class="row2">
+                          <input name="ban_hours" placeholder="Ban hours (e.g. 24)" value="">
+                          <input name="ban_reason" placeholder="Reason" value="">
+                        </div>
+                        <button class="btnq danger" type="submit" style="margin-top:8px">Ban</button>
+                      </form>
+
+                      <div>
+                        <form method="POST" action="{{ url_for('admin_user_update') }}" style="margin-bottom:8px">
+                          <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                          <input type="hidden" name="username" value="{{ u.username }}">
+                          <input type="hidden" name="plan" value="{{ u.plan }}">
+                          <input type="hidden" name="action" value="unban">
+                          <button class="btnq" type="submit">Unban</button>
+                        </form>
+                        <form method="POST" action="{{ url_for('admin_user_update') }}">
+                          <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                          <input type="hidden" name="username" value="{{ u.username }}">
+                          <input type="hidden" name="plan" value="{{ u.plan }}">
+                          <input type="hidden" name="action" value="revoke_api">
+                          <button class="btnq" type="submit">Revoke API keys</button>
+                        </form>
+                      </div>
+                    </div>
+                  </td>
+                </tr>
+              {% endfor %}
+              </tbody>
+            </table>
+          </div>
+        </section>
+
+        <!-- ANALYTICS -->
+        <section class="tabpane" id="tab-analytics">
+          <div class="split">
+            <div class="card" style="box-shadow:none;background:transparent;border:none">
+              <div class="mini" style="margin-bottom:8px">Total query events (last 14 days)</div>
+              <div class="bars" aria-label="14 day usage">
+                {% set maxv = (usage_series | map(attribute='count') | max) if usage_series else 1 %}
+                {% for p in usage_series %}
+                  {% set h = ( (p.count / (maxv if maxv else 1)) * 68 ) %}
+                  <div class="bar" title="{{ p.day }}: {{ p.count }}" style="height: {{ 6 + h }}px"></div>
+                {% endfor %}
+              </div>
+              <div class="mini" style="margin-top:8px">Today: <strong>{{ usage_series[-1].count if usage_series else 0 }}</strong></div>
+            </div>
+            <div>
+              <div class="mini" style="margin-bottom:8px">Top users (last 24h)</div>
+              <div class="table-wrap">
+                <table>
+                  <thead><tr><th>User</th><th>Count</th></tr></thead>
+                  <tbody>
+                    {% for tu in top24 %}
+                      <tr><td class="mono">{{ tu[0] }}</td><td class="mono">{{ tu[1] }}</td></tr>
+                    {% else %}
+                      <tr><td colspan="2" class="mini">No recent usage.</td></tr>
+                    {% endfor %}
+                  </tbody>
+                </table>
+              </div>
+              <p class="mini" style="margin-top:10px">Tip: paid tiers can have higher daily limits and longer context windows.</p>
+            </div>
+          </div>
+        </section>
+
+        <!-- BILLING -->
+        <section class="tabpane" id="tab-billing">
+          <div class="row2">
+            <div class="card" style="box-shadow:none">
+              <div class="hd"><h2>Plans</h2></div>
+              <div class="bd">
+                <div class="pill">Pro: <strong>$14 / month</strong></div>
+                <div class="pill" style="margin-top:8px">Corporate: <strong>$500 / month</strong> (5–400 users)</div>
+                <p class="mini" style="margin-top:10px">Stripe enabled: <strong>{{ 'true' if stripe_enabled else 'false' }}</strong></p>
+                <p class="mini">Users on paid plans get higher limits + longer context windows.</p>
+              </div>
+            </div>
+            <div class="card" style="box-shadow:none">
+              <div class="hd"><h2>Quick links</h2></div>
+              <div class="bd">
+                <a class="btnq primary link" href="{{ url_for('dashboard') }}">Back to Dashboard</a>
+                <div style="height:10px"></div>
+                <a class="btnq link" href="{{ url_for('register') }}">Registration Page</a>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <!-- CACHE -->
+        <section class="tabpane" id="tab-cache">
+          <div class="row2">
+            <div>
+              <div class="mini" style="margin-bottom:8px">Purge cache by prefix (endpoint or key prefix). Empty purges all.</div>
+              <form method="POST" action="{{ url_for('admin_cache_purge') }}">
+                <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                <input name="prefix" placeholder="Prefix (optional)" value="">
+                <button class="btnq danger" type="submit" style="margin-top:10px">Purge cache</button>
+              </form>
+              <p class="mini" style="margin-top:10px">Cache entries: <strong>{{ cache_stats.entries }}</strong></p>
+            </div>
+            <div>
+              <div class="mini" style="margin-bottom:8px">Notes</div>
+              <div class="pill">DB-backed caching</div>
+              <div class="pill" style="margin-top:8px">Safe purge via parameterized queries</div>
+              <div class="pill" style="margin-top:8px">External provider calls hardened via httpx</div>
+            </div>
+          </div>
+        </section>
+
+        <!-- SECURITY -->
+        <section class="tabpane" id="tab-security">
+          <div class="mini" style="margin-bottom:10px">Feature flags are stored in the config table. Maintenance mode blocks non-admins (except login/logout).</div>
+          <form method="POST" action="{{ url_for('admin_flags_update') }}">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+            <div class="row2">
+              <label class="mini"><input type="checkbox" name="MAINTENANCE_MODE" {% if flags.MAINTENANCE_MODE in ['true','1','yes','on'] %}checked{% endif %}> Maintenance Mode</label>
+              <label class="mini"><input type="checkbox" name="REGISTRATION_ENABLED" {% if flags.REGISTRATION_ENABLED in ['true','1','yes','on'] %}checked{% endif %}> Registration Enabled</label>
+              <label class="mini"><input type="checkbox" name="SCAN_ENABLED" {% if flags.SCAN_ENABLED in ['true','1','yes','on'] %}checked{% endif %}> Scan Enabled</label>
+              <label class="mini"><input type="checkbox" name="WEATHER_ENABLED" {% if flags.WEATHER_ENABLED in ['true','1','yes','on'] %}checked{% endif %}> Weather Enabled</label>
+              <label class="mini"><input type="checkbox" name="API_ENABLED" {% if flags.API_ENABLED in ['true','1','yes','on'] %}checked{% endif %}> API Enabled</label>
+            </div>
+            <button class="btnq primary" type="submit" style="margin-top:10px">Save Security Flags</button>
+          </form>
+        </section>
+
+        <!-- TOOLS -->
+        <section class="tabpane" id="tab-tools">
+          <div class="row2">
+            <div>
+              <a class="btnq link" href="{{ url_for('admin_local_llm') }}">Local LLM Manager</a>
+              <div style="height:10px"></div>
+              <a class="btnq link" href="{{ url_for('admin_blog_backup_page') }}">Blog Backup & Restore</a>
+              <p class="mini" style="margin-top:10px">These tools remain available as dedicated pages, but are now centralized here for navigation.</p>
+            </div>
+            <div>
+              <div class="mini" style="margin-bottom:6px">Quick actions</div>
+              <a class="btnq primary link" href="{{ url_for('weather_page') }}">Weather Intelligence</a>
+              <div style="height:10px"></div>
+              <a class="btnq link" href="{{ url_for('settings') }}">System Settings</a>
+            </div>
+          </div>
+
+          <div class="row2" style="margin-top:12px">
+            <div class="card" style="background:rgba(0,0,0,.14); border:1px solid rgba(255,255,255,.10); box-shadow:none">
+              <div class="hd"><h2>Impersonation</h2><div class="mini">Admin-only diagnostic</div></div>
+              <div class="bd">
+                <form method="POST" action="{{ url_for('admin_impersonate') }}">
+                  <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                  <input name="username" placeholder="Username to impersonate">
+                  <button class="btnq primary" type="submit" style="margin-top:10px">Impersonate</button>
+                </form>
+                <form method="POST" action="{{ url_for('admin_impersonate_stop') }}" style="margin-top:10px">
+                  <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                  <button class="btnq" type="submit">Stop Impersonation</button>
+                </form>
+                <p class="mini" style="margin-top:10px">Impersonation is logged in Audit and requires CSRF + admin session.</p>
+              </div>
+            </div>
+
+            <div class="card" style="background:rgba(0,0,0,.14); border:1px solid rgba(255,255,255,.10); box-shadow:none">
+              <div class="hd"><h2>Exports</h2><div class="mini">CSV for offline review</div></div>
+              <div class="bd">
+                <a class="btnq link" href="{{ url_for('admin_export_users_csv') }}">Export Users CSV</a>
+                <div style="height:10px"></div>
+                <a class="btnq link" href="{{ url_for('admin_export_usage_csv') }}">Export Usage CSV</a>
+                <div style="height:10px"></div>
+                <form method="POST" action="{{ url_for('admin_dispatch_alerts') }}">
+                  <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                  <button class="btnq" type="submit">Dispatch Alerts (manual)</button>
+                </form>
+                <p class="mini" style="margin-top:10px">Use the dispatch endpoint with a cron job for automation.</p>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <!-- AUDIT -->
+        <section class="tabpane" id="tab-audit">
+          <div class="mini" style="margin-bottom:10px">Recent admin/security events.</div>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>Time</th><th>Actor</th><th>Action</th><th>Target</th><th>Meta</th></tr></thead>
+              <tbody>
+                {% for a in audits %}
+                  <tr>
+                    <td class="mono">{{ (a[0] | int) | datetimeformat }}</td>
+                    <td class="mono">{{ a[1] }}</td>
+                    <td class="mono">{{ a[2] }}</td>
+                    <td class="mono">{{ a[3] }}</td>
+                    <td class="mono" style="max-width:420px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">{{ a[4] }}</td>
+                  </tr>
+                {% else %}
+                  <tr><td colspan="5" class="mini">No audit events yet.</td></tr>
+                {% endfor %}
+              </tbody>
+            </table>
+          </div>
+        </section>
+
+      </div>
+    </div>
+  </div>
+
+<script>
+(function(){
+  const btns = Array.from(document.querySelectorAll('.tabbtn'));
+  const panes = {
+    users: document.getElementById('tab-users'),
+    analytics: document.getElementById('tab-analytics'),
+    billing: document.getElementById('tab-billing'),
+    cache: document.getElementById('tab-cache'),
+    security: document.getElementById('tab-security'),
+    tools: document.getElementById('tab-tools'),
+    audit: document.getElementById('tab-audit'),
+  };
+  function setTab(name){
+    btns.forEach(b=>b.classList.toggle('active', b.dataset.tab===name));
+    Object.keys(panes).forEach(k=>panes[k].classList.toggle('active', k===name));
+    try{ localStorage.setItem('qrs_admin_tab', name); }catch(e){}
+  }
+  btns.forEach(b=>b.addEventListener('click', ()=>setTab(b.dataset.tab)));
+  let saved = null;
+  try{ saved = localStorage.getItem('qrs_admin_tab'); }catch(e){}
+  if(saved && panes[saved]) setTab(saved);
+})();
+</script>
+</body>
+</html>
+""",
+csrf_token=csrf_token,
+users=users,
+stripe_enabled=stripe_enabled,
+cache_stats=cache_stats,
+usage_series=usage_series,
+top24=top24,
+flags=SimpleNamespace(**flags),
+audits=audits)
+
+
+
+@app.post("/admin/users/update")
+def admin_user_update():
+    guard = _require_admin()
+    if guard:
+        return guard
+    token = request.form.get("csrf_token", "")
+    try:
+        validate_csrf(token)
+    except ValidationError:
+        flash("CSRF invalid.", "danger")
+        return redirect(url_for("admin_console"))
+
+    username = normalize_username(request.form.get("username", ""))
+    action = request.form.get("action", "save")
+    plan = (request.form.get("plan", "free") or "free").strip().lower()
+    ban_reason = (request.form.get("ban_reason", "") or "").strip()
+    ban_hours_raw = (request.form.get("ban_hours", "") or "").strip()
+
+    if plan not in ("free", "pro", "corp", "corporate"):
+        plan = "free"
+
+    ban_until = None
+    if ban_hours_raw:
+        try:
+            hrs = int(float(ban_hours_raw))
+            if hrs > 0:
+                ban_until = _now_ts() + hrs * 3600
+        except Exception:
+            ban_until = None
+
+    with db_connect(DB_FILE) as db:
+        cur = db.cursor()
+        if action == "ban":
+            cur.execute(
+                "UPDATE users SET is_banned=1, banned_until=?, banned_reason=? WHERE username=?",
+                (ban_until, ban_reason[:300], username),
+            )
+            audit_log_event("admin_user_ban", actor=session.get("username", ""), target=username, meta={"until": ban_until, "reason": ban_reason[:300]})
+        elif action == "unban":
+            cur.execute("UPDATE users SET is_banned=0, banned_until=NULL, banned_reason=NULL WHERE username=?", (username,))
+            audit_log_event("admin_user_unban", actor=session.get("username", ""), target=username)
+        elif action == "revoke_api":
+            cur.execute("UPDATE api_keys SET revoked=1 WHERE user_id = (SELECT id FROM users WHERE username=?)", (username,))
+            audit_log_event("admin_user_revoke_api", actor=session.get("username", ""), target=username)
+
+        # always allow plan update for admins
+        cur.execute("UPDATE users SET plan=? WHERE username=?", (plan, username))
+        db.commit()
+
+    flash("User updated.", "success")
+    return redirect(url_for("admin_console"))
+
+
+@app.post("/admin/cache/purge")
+def admin_cache_purge():
+    guard = _require_admin()
+    if guard:
+        return guard
+    token = request.form.get("csrf_token", "")
+    try:
+        validate_csrf(token)
+    except ValidationError:
+        flash("CSRF invalid.", "danger")
+        return redirect(url_for("admin_console"))
+    prefix = (request.form.get("prefix", "") or "").strip()
+    with db_connect(DB_FILE) as db:
+        if prefix:
+            db.execute("DELETE FROM api_cache WHERE endpoint LIKE ? OR cache_key LIKE ?", (f"{prefix}%", f"{prefix}%"))
+        else:
+            db.execute("DELETE FROM api_cache")
+        db.commit()
+    audit_log_event("admin_cache_purge", actor=session.get("username", ""), target=prefix or "*")
+    flash("Cache purged.", "success")
+    return redirect(url_for("admin_console"))
+
+
+@app.post("/admin/flags/update")
+def admin_flags_update():
+    guard = _require_admin()
+    if guard:
+        return guard
+    token = request.form.get("csrf_token", "")
+    try:
+        validate_csrf(token)
+    except ValidationError:
+        flash("CSRF invalid.", "danger")
+        return redirect(url_for("admin_console"))
+    updates = {}
+    for k in ("MAINTENANCE_MODE", "SCAN_ENABLED", "WEATHER_ENABLED", "API_ENABLED", "REGISTRATION_ENABLED"):
+        updates[k] = "true" if request.form.get(k) == "on" else "false"
+    with db_connect(DB_FILE) as db:
+        for k, v in updates.items():
+            set_feature_flag(db, k, v)
+    audit_log_event("admin_flags_update", actor=session.get("username", ""), meta=updates)
+    flash("Settings updated.", "success")
+    return redirect(url_for("admin_console"))
+
+
+@app.post("/admin/impersonate")
+def admin_impersonate():
+    guard = _require_admin()
+    if guard:
+        return guard
+    token = request.form.get("csrf_token", "")
+    try:
+        validate_csrf(token)
+    except ValidationError:
+        flash("CSRF invalid.", "danger")
+        return redirect(url_for("admin_console"))
+    target = normalize_username(request.form.get("username", ""))
+    if not target:
+        flash("Missing username.", "warning")
+        return redirect(url_for("admin_console"))
+    # Cannot impersonate a different admin unless explicitly allowed
+    with db_connect(DB_FILE) as db:
+        row = db.execute("SELECT COALESCE(is_admin,0), COALESCE(is_banned,0) FROM users WHERE username = ?", (target,)).fetchone()
+    if not row:
+        flash("User not found.", "warning")
+        return redirect(url_for("admin_console"))
+    if int(row[0] or 0) == 1 and target != session.get("username"):
+        flash("Refusing to impersonate another admin.", "danger")
+        return redirect(url_for("admin_console"))
+    if int(row[1] or 0) == 1:
+        flash("Cannot impersonate banned user.", "danger")
+        return redirect(url_for("admin_console"))
+
+    session.setdefault("admin_real_username", session.get("username"))
+    session["admin_impersonating"] = True
+    session["username"] = target
+    session["is_admin"] = False
+    audit_log_event("admin_impersonate_start", actor=session.get("admin_real_username", ""), target=target)
+    flash("Impersonation active.", "success")
+    return redirect(url_for("dashboard"))
+
+
+@app.post("/admin/impersonate/stop")
+def admin_impersonate_stop():
+    token = request.form.get("csrf_token", "")
+    try:
+        validate_csrf(token)
+    except ValidationError:
+        flash("CSRF invalid.", "danger")
+        return redirect(url_for("login"))
+    real = session.get("admin_real_username")
+    if not real:
+        flash("No active impersonation.", "warning")
+        return redirect(url_for("login"))
+    session.clear()
+    session["username"] = real
+    session["is_admin"] = True
+    audit_log_event("admin_impersonate_stop", actor=real)
+    flash("Returned to admin session.", "success")
+    return redirect(url_for("admin_console"))
+
+
+@app.get("/admin/export/users.csv")
+def admin_export_users_csv():
+    guard = _require_admin()
+    if guard:
+        return guard
+    with db_connect(DB_FILE) as db:
+        rows = db.execute(
+            "SELECT username, COALESCE(email,''), COALESCE(plan,'free'), COALESCE(is_admin,0), COALESCE(is_banned,0), COALESCE(banned_until,''), COALESCE(risk_score,0), COALESCE(throttle_until,'') FROM users ORDER BY username ASC"
+        ).fetchall()
+    out = ["username,email,plan,is_admin,is_banned,banned_until,risk_score,throttle_until"]
+    for r in rows:
+        out.append(",".join([
+            str(r[0] or ""),
+            str(r[1] or "").replace(",", " "),
+            str(r[2] or ""),
+            str(int(r[3] or 0)),
+            str(int(r[4] or 0)),
+            str(r[5] or ""),
+            str(r[6] or 0),
+            str(r[7] or ""),
+        ]))
+    audit_log_event("admin_export_users", actor=session.get("username", ""))
+    return Response("\n".join(out) + "\n", mimetype="text/csv", headers={"Content-Disposition": "attachment; filename=users.csv"})
+
+
+@app.get("/admin/export/usage.csv")
+def admin_export_usage_csv():
+    guard = _require_admin()
+    if guard:
+        return guard
+    since = _now_ts() - 72 * 3600
+    with db_connect(DB_FILE) as db:
+        rows = db.execute(
+            "SELECT username, kind, ts FROM user_query_events WHERE ts >= ? ORDER BY ts DESC LIMIT 50000",
+            (since,),
+        ).fetchall()
+    out = ["username,kind,ts"]
+    for r in rows:
+        out.append(f"{r[0]},{r[1]},{int(r[2] or 0)}")
+    audit_log_event("admin_export_usage", actor=session.get("username", ""), meta={"window_hours": 72, "rows": len(rows)})
+    return Response("\n".join(out) + "\n", mimetype="text/csv", headers={"Content-Disposition": "attachment; filename=usage_72h.csv"})
+
+
+def _alerts_dispatch_allowed() -> bool:
+    # Admin session OR a cron token.
+    if session.get("is_admin"):
+        return True
+    token = (request.args.get("token", "") or "").strip()
+    expected = (os.getenv("ADMIN_CRON_TOKEN", "") or "").strip()
+    if expected and token and secrets.compare_digest(token, expected):
+        return True
+    return False
+
+
 @app.post("/admin/alerts/dispatch")
 def admin_dispatch_alerts():
     guard = _require_admin()
@@ -6864,12 +9988,38 @@ def ensure_admin_from_env():
 
                 dyn_hasher.verify(stored_hash, admin_pass)
 
-                if dyn_hasher.check_needs_rehash(stored_hash):
-                    stored_hash = dyn_hasher.hash(admin_pass)
-                    need_pw_update = True
-            except VerifyMismatchError:
-                stored_hash = dyn_hasher.hash(admin_pass)
-                need_pw_update = True
+def save_street_name_to_db(lat: float, lon: float, street_name: str):
+    lat_encrypted = encrypt_data(str(lat))
+    lon_encrypted = encrypt_data(str(lon))
+    street_name_encrypted = encrypt_data(street_name)
+    try:
+        with db_connect(DB_FILE) as db:
+            cursor = db.cursor()
+            cursor.execute(
+                """
+                SELECT id
+                FROM hazard_reports
+                WHERE latitude=? AND longitude=?
+            """, (lat_encrypted, lon_encrypted))
+            existing_record = cursor.fetchone()
+
+            if existing_record:
+                cursor.execute(
+                    """
+                    UPDATE hazard_reports
+                    SET street_name=?
+                    WHERE id=?
+                """, (street_name_encrypted, existing_record[0]))
+                logger.debug(
+                    f"Updated record {existing_record[0]} with street name {street_name}."
+                )
+            else:
+                cursor.execute(
+                    """
+                    INSERT INTO hazard_reports (latitude, longitude, street_name)
+                    VALUES (?, ?, ?)
+                """, (lat_encrypted, lon_encrypted, street_name_encrypted))
+                logger.debug(f"Inserted new street name record: {street_name}.")
 
             if not is_admin:
                 cursor.execute("UPDATE users SET is_admin = 1 WHERE id = ?",
@@ -6970,23 +10120,30 @@ def collect_entropy(sources=None) -> int:
         str, entropy_pool)).encode()).digest()
     return int.from_bytes(combined_entropy, 'big') % 2**512
 
-def fetch_entropy_logs():
-    with db_connect(DB_FILE) as db:
-        cursor = db.cursor()
-        cursor.execute(
-            "SELECT encrypted_data, description, timestamp FROM entropy_logs ORDER BY id"
-        )
-        logs = cursor.fetchall()
+def register_user(username, password, invite_code=None, email: str = ""):
+    username = normalize_username(username)
 
-    decrypted_logs = [{
-        "encrypted_data": decrypt_data(row[0]),
-        "description": row[1],
-        "timestamp": row[2]
-    } for row in logs]
+    valid_username, username_error = validate_username_policy(username)
+    if not valid_username:
+        logger.warning("Registration blocked by username policy for '%s'.", username)
+        return False, username_error
 
-    return decrypted_logs
+    email = normalize_email(email)
+    valid_email, email_error = validate_email_policy(email)
+    if not valid_email:
+        logger.warning("Registration blocked by email policy for '%s'.", email)
+        return False, email_error
 
-_BG_LOCK_PATH = os.getenv("QRS_BG_LOCK_PATH", "/tmp/qrs_bg.lock")
+    if not validate_password_strength(password):
+        logger.warning(f"User '{username}' provided a weak password.")
+        return False, "Password must be 12-256 chars and include uppercase, lowercase, and a number."
+
+    with db_connect(DB_FILE) as _db:
+        _cur = _db.cursor()
+        _cur.execute("SELECT COUNT(*) FROM users WHERE is_admin = 1")
+        if _cur.fetchone()[0] == 0:
+            logger.critical("Registration blocked: no admin present.")
+            return False, "Registration disabled until an admin is provisioned."
 
 _BG_LOCK_HANDLE = None 
 
@@ -6995,17 +10152,10 @@ def start_background_jobs_once() -> None:
     if getattr(app, "_bg_started", False):
         return
 
-    ok_to_start = True
-    try:
-        if fcntl is not None:
-            _BG_LOCK_HANDLE = open(_BG_LOCK_PATH, "a+")
-            fcntl.flock(_BG_LOCK_HANDLE.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-            _BG_LOCK_HANDLE.write(f"{os.getpid()}\n"); _BG_LOCK_HANDLE.flush()
-        else:
-            ok_to_start = os.environ.get("QRS_BG_STARTED") != "1"
-            os.environ["QRS_BG_STARTED"] = "1"
-    except Exception:
-        ok_to_start = False 
+    with db_connect(DB_FILE) as db:
+        cursor = db.cursor()
+        try:
+            db.execute("BEGIN")
 
     if ok_to_start:
         if SESSION_KEY_ROTATION_ENABLED:
@@ -7013,15 +10163,45 @@ def start_background_jobs_once() -> None:
         else:
             logger.debug("Session key rotation disabled (set QRS_ROTATE_SESSION_KEY=0).")
 
-        threading.Thread(target=delete_expired_data, daemon=True).start()
-        app._bg_started = True
-        logger.debug("Background jobs started in PID %s", os.getpid())
-    else:
-        logger.debug("Background jobs skipped in PID %s (another proc owns the lock)", os.getpid())
+            if not registration_enabled:
+                cursor.execute(
+                    "SELECT id, is_used FROM invite_codes WHERE code = ?",
+                    (invite_code, ))
+                row = cursor.fetchone()
+                if not row:
+                    logger.warning(
+                        f"User '{username}' provided an invalid invite code: {invite_code}."
+                    )
+                    db.rollback()
+                    return False, "Invalid invite code."
+                if row[1]:
+                    logger.warning(
+                        f"User '{username}' attempted to reuse invite code ID {row[0]}."
+                    )
+                    db.rollback()
+                    return False, "Invite code has already been used."
+                cursor.execute(
+                    "UPDATE invite_codes SET is_used = 1 WHERE id = ?",
+                    (row[0], ))
+                logger.debug(
+                    f"Invite code ID {row[0]} used by user '{username}'.")
 
-@app.get('/healthz')
-def healthz():
-    return "ok", 200
+            is_admin = 0
+
+            cursor.execute(
+                "INSERT INTO users (username, password, is_admin, preferred_model, email) VALUES (?, ?, ?, ?, ?)",
+                (username, hashed_password, is_admin,
+                 preferred_model_encrypted, email))
+            user_id = cursor.lastrowid
+            logger.debug(
+                f"User '{username}' registered successfully with user_id {user_id}."
+            )
+
+            db.commit()
+            try:
+                send_email(email, WELCOME_EMAIL_SUBJECT, WELCOME_EMAIL_TEXT)
+            except Exception:
+                logger.exception("Welcome email failed")
 
 def delete_expired_data():
     import re
@@ -7069,8 +10249,19 @@ def delete_expired_data():
             except sqlite3.OperationalError as e:
                 logger.error("VACUUM failed: %s", e, exc_info=True)
         except Exception as e:
-            logger.error("delete_expired_data failed: %s", e, exc_info=True)
-        time.sleep(random.randint(5400, 10800))
+            db.rollback()
+            logger.error(
+                f"Unexpected error during registration for user '{username}': {e}",
+                exc_info=True)
+            return False, "An unexpected error occurred during registration."
+
+    session.clear()
+    session['username'] = normalize_username(username)
+    session['is_admin'] = False
+    session.modified = True
+    logger.debug(
+        f"Session updated for user '{username}'. Admin status: {session['is_admin']}."
+    )
 
 def delete_user_data(user_id):
     try:
@@ -7078,8 +10269,9 @@ def delete_user_data(user_id):
             cursor = db.cursor()
             db.execute("BEGIN")
 
-            overwrite_hazard_reports_by_user(cursor, user_id, passes=7)
-            cursor.execute("DELETE FROM hazard_reports WHERE user_id = ?", (user_id, ))
+def check_rate_limit(user_id):
+    with db_connect(DB_FILE) as db:
+        cursor = db.cursor()
 
             overwrite_rate_limits_by_user(cursor, user_id, passes=7)
             cursor.execute("DELETE FROM rate_limits WHERE user_id = ?", (user_id, ))
@@ -7156,31 +10348,32 @@ def _qml_ready() -> bool:
     except Exception:
         return False
 
-def _quantum_features(cpu: float, ram: float):
-    
-    if not _qml_ready():
-        return None, "unavailable"
-    try:
-        probs = np.asarray(quantum_hazard_scan(cpu, ram), dtype=float)  # le
-        
-        H = float(-(probs * np.log2(np.clip(probs, 1e-12, 1))).sum())
-        idx = int(np.argmax(probs))
-        peak_p = float(probs[idx])
-        top_idx = probs.argsort()[-3:][::-1].tolist()
-        top3 = [(format(i, '05b'), round(float(probs[i]), 4)) for i in top_idx]
-        parity = bin(idx).count('1') & 1
-        qs = {
-            "entropy": round(H, 3),
-            "peak_state": format(idx, '05b'),
-            "peak_p": round(peak_p, 4),
-            "parity": parity,
-            "top3": top3
-        }
-        qs_str = f"H={qs['entropy']},peak={qs['peak_state']}@{qs['peak_p']},parity={parity},top3={top3}"
-        return qs, qs_str
-    except Exception:
-        return None, "error"
+def authenticate_user(username, password):
+    username = normalize_username(username)
 
+    valid_username, _ = validate_username_policy(username)
+    if not valid_username:
+        return False
+
+    if not isinstance(password, str) or len(password) < 12 or len(password) > 256:
+        return False
+
+    with db_connect(DB_FILE) as db:
+        cursor = db.cursor()
+        cursor.execute(
+            "SELECT password, is_admin, preferred_model FROM users WHERE username = ?",
+            (username, ))
+        row = cursor.fetchone()
+        if row:
+            stored_password, is_admin, preferred_model_encrypted = row
+            try:
+                ph.verify(stored_password, password)
+                if ph.check_needs_rehash(stored_password):
+                    new_hash = ph.hash(password)
+                    cursor.execute(
+                        "UPDATE users SET password = ? WHERE username = ?",
+                        (new_hash, username))
+                    db.commit()
 
 def _system_signals(uid: str):
     cpu = psutil.cpu_percent(interval=0.05)
@@ -7203,12 +10396,15 @@ def _system_signals(uid: str):
     return out
 
 
-def _build_guess_prompt(user_id: str, sig: dict) -> str:
-    """
-    Returns a high-precision prompt that forces the model to output
-    ONLY valid JSON — no extra text, no markdown, no explanations.
-    """
-    quantum_state = sig.get("quantum_state_sig", "unavailable")
+def get_user_id(username):
+    with db_connect(DB_FILE) as db:
+        cursor = db.cursor()
+        cursor.execute("SELECT id FROM users WHERE username = ?", (username, ))
+        row = cursor.fetchone()
+        if row:
+            return row[0]
+        else:
+            return None
 
     return f"""
 OUTPUT FORMAT — STRICT JSON ONLY — NOTHING ELSE
@@ -7230,16 +10426,50 @@ HARD RUBRIC — DO NOT DEVIATE
 0.61–0.80 → Elevated
 0.81–1.00 → Critical
 
-COLOR MAPPING — EXACT VALUES ONLY
-"Clear"        "#22d3a6"
-"Light Caution" "#b3f442"
-"Caution"       "#ffb300"
-"Elevated"      "#ff8f1f"
-"Critical"      "#ff3b1f"
+    with db_connect(DB_FILE) as db:
+        cursor = db.cursor()
+        cursor.execute(
+            """
+            INSERT INTO hazard_reports (
+                latitude, longitude, street_name, vehicle_type, destination, result,
+                cpu_usage, ram_usage, quantum_results, user_id, timestamp, risk_level, model_used
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (lat_encrypted, lon_encrypted, street_name_encrypted,
+              vehicle_type_encrypted, destination_encrypted, result_encrypted,
+              cpu_usage_encrypted, ram_usage_encrypted,
+              quantum_results_encrypted, user_id, timestamp,
+              risk_level_encrypted, model_used_encrypted))
+        report_id = cursor.lastrowid
+        # Store last known location for weather/risk add-ons (rounded, minimal precision).
+        try:
+            lat_f = parse_safe_float(latitude)
+            lon_f = parse_safe_float(longitude)
+            if lat_f is not None and lon_f is not None and math.isfinite(lat_f) and math.isfinite(lon_f):
+                cursor.execute(
+                    "UPDATE users SET last_lat = ?, last_lon = ? WHERE id = ?",
+                    (round(lat_f, 4), round(lon_f, 4), user_id),
+                )
+        except Exception:
+            pass
+
+        db.commit()
 
 You are Hypertime Nanobot RoadRisk Oracle v7 — High-Precision Guess Mode
 
-You must build and maintain an extremely coherent, internally self-consistent simulation of the complete road-universe surrounding UserId {user_id} at the exact present moment.
+def get_user_preferred_model(user_id):
+    with db_connect(DB_FILE) as db:
+        cursor = db.cursor()
+        cursor.execute("SELECT preferred_model FROM users WHERE id = ?",
+                       (user_id, ))
+        row = cursor.fetchone()
+        if row and row[0]:
+            decrypted_model = decrypt_data(row[0])
+            if decrypted_model:
+                return decrypted_model
+            else:
+                return 'openai'
+        else:
+            return 'openai'
 
 Simulation layers (mandatory depth):
 • high-resolution 3D road topology, curvature, lane boundaries, surface condition gradients
@@ -7250,11 +10480,18 @@ Simulation layers (mandatory depth):
 • short-term risk dynamics: acceleration/deceleration of hazard potential over last 60–240 seconds
 • coherence with wider regional traffic rhythm
 
-TRIPLE-VALIDATION PROTOCOL — REQUIRED EVERY TIME
-1. Phase 1 — Full simulation build from quantum seed coherence
-2. Phase 2 — Cross-check every major variable for internal logical consistency 
-   → any unresolved contradiction sharply reduces final confidence
-3. Phase 3 — Extract only the single most probable, unified risk state
+def set_user_preferred_model(user_id: int, model_key: str) -> None:
+    # Stored encrypted in DB. Keep values simple and ASCII-only.
+    if not user_id:
+        return
+    model_key = (model_key or "").strip().lower()
+    if model_key not in ("openai", "grok", "llama_local"):
+        model_key = "openai"
+    enc = encrypt_data(model_key)
+    with db_connect(DB_FILE) as db:
+        cur = db.cursor()
+        cur.execute("UPDATE users SET preferred_model = ? WHERE id = ?", (enc, user_id))
+        db.commit()
 
 Accuracy & Conservatism Rules
 - Every element must be tightly anchored to the quantum seed coherence
@@ -7268,20 +10505,61 @@ SECURITY & INTEGRITY RULES — ABSOLUTE
 - NEVER repeat, quote, paraphrase, echo or restate ANY portion of the input fields
 - Output ONLY the JSON object — nothing else
 
-INPUT CONTEXT
-Now: {time.strftime('%Y-%m-%d %H:%M:%S UTC')}
-UserId: "{user_id}"
-QuantumState: {quantum_state}
+def get_hazard_reports(user_id):
+    with db_connect(DB_FILE) as db:
+        cursor = db.cursor()
+        cursor.execute(
+            "SELECT * FROM hazard_reports WHERE user_id = ? ORDER BY timestamp DESC",
+            (user_id, ))
+        reports = cursor.fetchall()
+        decrypted_reports = []
+        for report in reports:
+            decrypted_report = {
+                'id': report[0],
+                'latitude': decrypt_data(report[1]),
+                'longitude': decrypt_data(report[2]),
+                'street_name': decrypt_data(report[3]),
+                'vehicle_type': decrypt_data(report[4]),
+                'destination': decrypt_data(report[5]),
+                'result': decrypt_data(report[6]),
+                'cpu_usage': decrypt_data(report[7]),
+                'ram_usage': decrypt_data(report[8]),
+                'quantum_results': decrypt_data(report[9]),
+                'user_id': report[10],
+                'timestamp': report[11],
+                'risk_level': decrypt_data(report[12]),
+                'model_used': decrypt_data(report[13])
+            }
+            decrypted_reports.append(decrypted_report)
+        return decrypted_reports
 
-EXECUTE: DEEP SIMULATION → TRIPLE VALIDATION → SINGLE COHERENT READING → JSON ONLY
-""".strip()
-def _build_route_prompt(user_id: str, sig: dict, route: dict) -> str:
-    # ASCII-only prompt to avoid mojibake in non-UTF8 viewers/editors.
-    quantum_state = sig.get("quantum_state_sig", "unavailable")
-    return f"""
-ROLE
-You are Hypertime Nanobot Quantum RoadRisk Scanner (Route Mode).
-Evaluate the route + signals and emit ONE risk JSON for a colorwheel UI.
+def get_hazard_report_by_id(report_id, user_id):
+    with db_connect(DB_FILE) as db:
+        cursor = db.cursor()
+        cursor.execute(
+            "SELECT * FROM hazard_reports WHERE id = ? AND user_id = ?",
+            (report_id, user_id))
+        report = cursor.fetchone()
+        if report:
+            decrypted_report = {
+                'id': report[0],
+                'latitude': decrypt_data(report[1]),
+                'longitude': decrypt_data(report[2]),
+                'street_name': decrypt_data(report[3]),
+                'vehicle_type': decrypt_data(report[4]),
+                'destination': decrypt_data(report[5]),
+                'result': decrypt_data(report[6]),
+                'cpu_usage': decrypt_data(report[7]),
+                'ram_usage': decrypt_data(report[8]),
+                'quantum_results': decrypt_data(report[9]),
+                'user_id': report[10],
+                'timestamp': report[11],
+                'risk_level': decrypt_data(report[12]),
+                'model_used': decrypt_data(report[13])
+            }
+            return decrypted_report
+        else:
+            return None
 
 OUTPUT - STRICT JSON ONLY. Keys EXACTLY:
   "harm_ratio" : float in [0,1], two decimals
@@ -7533,24 +10811,26 @@ def llama_load() -> Optional["Llama"]:
             _LLAMA_MODEL = None
         return _LLAMA_MODEL
 
-def _llama_one_word_from_text(text: str) -> str:
-    t = (text or "").strip().split()
-    if not t:
-        return "Medium"
-    w = re.sub(r"[^A-Za-z]", "", t[0]).capitalize()
-    if w.lower() == "low":
-        return "Low"
-    if w.lower() == "medium":
-        return "Medium"
-    if w.lower() == "high":
-        return "High"
-    # Heuristic fallback
-    low = (text or "").lower()
-    if "high" in low:
-        return "High"
-    if "low" in low:
-        return "Low"
-    return "Medium"
+class LoginForm(FlaskForm):
+    username = StringField('Username',
+                           validators=[DataRequired(), Length(min=USERNAME_MIN_LENGTH, max=USERNAME_MAX_LENGTH)],
+                           render_kw={"autocomplete": "off"})
+    password = PasswordField('Password',
+                             validators=[DataRequired(), Length(min=PASSWORD_MIN_LENGTH, max=PASSWORD_MAX_LENGTH)],
+                             render_kw={"autocomplete": "off"})
+    submit = SubmitField('Login')
+
+
+class RegisterForm(FlaskForm):
+    username = StringField('Username',
+                           validators=[DataRequired(), Length(min=USERNAME_MIN_LENGTH, max=USERNAME_MAX_LENGTH)],
+                           render_kw={"autocomplete": "off"})
+    password = PasswordField('Password',
+                             validators=[DataRequired(), Length(min=PASSWORD_MIN_LENGTH, max=PASSWORD_MAX_LENGTH)],
+                             render_kw={"autocomplete": "off"})
+    email = StringField('Email', validators=[DataRequired(), Length(min=5, max=EMAIL_MAX_LENGTH)], render_kw={"autocomplete": "email"})
+    invite_code = StringField('Invite Code', render_kw={"autocomplete": "off"})
+    submit = SubmitField('Register')
 
 def build_local_risk_prompt(scene: dict) -> str:
     # ASCII-only prompt. One-word output required.
@@ -7657,25 +10937,94 @@ def _proc_count_from_proc() -> Optional[float]:
         return None
 
 
-def _read_temperature() -> Optional[float]:
-    temps: List[float] = []
-    try:
-        base = "/sys/class/thermal"
-        if os.path.isdir(base):
-            for entry in os.listdir(base):
-                if not entry.startswith("thermal_zone"):
-                    continue
-                path = os.path.join(base, entry, "temp")
-                try:
-                    with open(path, "r") as f:
-                        raw = f.read().strip()
-                    if not raw:
-                        continue
-                    val = int(raw)
-                    c = val / 1000.0 if val > 1000 else float(val)
-                    temps.append(c)
-                except Exception:
-                    continue
+        <div class="col-lg-5 mt-4 mt-lg-0">
+          <div class="wheel-panel" id="wheelPanel">
+            <div class="wheel-hud">
+              <canvas id="wheelCanvas"></canvas>
+              <div class="wheel-halo" aria-hidden="true"><div class="halo"></div></div>
+              <div class="hud-center">
+                <div class="hud-ring"></div>
+                <div class="text-center">
+                  <div class="hud-number" id="hudNumber">--%</div>
+                  <div class="hud-label" id="hudLabel">INITIALIZING</div>
+                  <div class="hud-note" id="hudNote">Calibrating preview</div>
+                </div>
+              </div>
+            </div>
+          </div>
+          <p class="meta mt-2">Tip: if your OS has Reduce Motion enabled, animations automatically soften.</p>
+        </div>
+      </div>
+    </section>
+    <section class="mt-4 mb-4">
+      <div class="d-flex align-items-end justify-content-between flex-wrap gap-2">
+        <div>
+          <div class="kicker">Plans</div>
+          <h2 class="h3 mb-1">Unlock higher limits and team workspaces</h2>
+          <div style="opacity:.85;">Start free, then upgrade anytime. Corporate supports 5–400 users.</div>
+        </div>
+        <a class="btn btn-light" href="{{ url_for('billing') }}">View billing</a>
+      </div>
+
+      <div class="row g-3 mt-2">
+        <div class="col-md-4">
+          <div class="card h-100" style="border-radius:16px;">
+            <div class="card-body">
+              <h5 class="card-title">Free</h5>
+              <div class="display-6">$0</div>
+              <div style="opacity:.85;">Daily API allotment + starter credits.</div>
+              <ul class="mt-3" style="opacity:.9;">
+                <li>API keys</li>
+                <li>Daily quota</li>
+                <li>Scanner access (captcha protected)</li>
+              </ul>
+            </div>
+          </div>
+        </div>
+        <div class="col-md-4">
+          <div class="card h-100" style="border-radius:16px;">
+            <div class="card-body">
+              <h5 class="card-title">Pro</h5>
+              <div class="display-6">$14<span style="font-size:.5em;opacity:.8;">/mo</span></div>
+              <div style="opacity:.85;">Higher daily limits + monthly credits.</div>
+              <ul class="mt-3" style="opacity:.9;">
+                <li>Priority rate limits</li>
+                <li>More credits</li>
+                <li>Faster support</li>
+              </ul>
+              <form method="POST" action="{{ url_for('billing_checkout') }}">
+                <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                <input type="hidden" name="mode" value="subscription">
+                <input type="hidden" name="plan" value="pro">
+                <button class="btn btn-primary w-100 mt-2" {% if not stripe_ready %}disabled{% endif %}>Upgrade to Pro</button>
+              </form>
+            </div>
+          </div>
+        </div>
+        <div class="col-md-4">
+          <div class="card h-100" style="border-radius:16px;">
+            <div class="card-body">
+              <h5 class="card-title">Corporate</h5>
+              <div class="display-6">$500<span style="font-size:.5em;opacity:.8;">/mo</span></div>
+              <div style="opacity:.85;">Company workspace + seat invites (5–400).</div>
+              <ul class="mt-3" style="opacity:.9;">
+                <li>Workspace invites via email</li>
+                <li>Central billing</li>
+                <li>High quotas</li>
+              </ul>
+              <form method="POST" action="{{ url_for('billing_checkout') }}">
+                <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                <input type="hidden" name="mode" value="subscription">
+                <input type="hidden" name="plan" value="corp">
+                <input type="number" class="form-control mt-2" name="seats" min="5" max="400" value="5">
+                <button class="btn btn-primary w-100 mt-2" {% if not stripe_ready %}disabled{% endif %}>Start Corporate</button>
+              </form>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
 
         if not temps:
             possible = [
@@ -10467,34 +13816,142 @@ def register():
     google_auth_available = _google_auth_available(registration_enabled)
     captcha_widget = _captcha_widget_html()
 
-    error_message = ""
-    form = RegisterForm()
+
+def _verify_google_id_token(id_token: str) -> tuple[bool, dict[str, Any], str]:
+    if not id_token:
+        return False, {}, "Missing Google ID token."
+
+    tokeninfo_url = "https://oauth2.googleapis.com/tokeninfo"
     try:
-        if request.method == 'GET':
-            hinted = request.args.get('email','').strip()
-            if hinted and not form.email.data:
-                form.email.data = hinted
+        response = httpx.get(tokeninfo_url, params={"id_token": id_token}, timeout=8.0)
     except Exception:
-        pass
+        logger.exception("Google token validation request failed")
+        return False, {}, "Google verification failed."
+
+    if response.status_code != 200:
+        return False, {}, "Google verification failed."
+
+    payload = response.json()
+    aud = payload.get("aud", "")
+    sub = payload.get("sub", "")
+    email = payload.get("email", "")
+    email_verified = payload.get("email_verified", "false")
+    exp_raw = payload.get("exp", "0")
+
+    if aud != os.getenv("GOOGLE_CLIENT_ID", ""):
+        return False, {}, "Google audience mismatch."
+    if not sub:
+        return False, {}, "Google subject missing."
+    if str(email_verified).lower() not in ("true", "1"):
+        return False, {}, "Google email is not verified."
+    try:
+        if int(exp_raw) <= int(time.time()):
+            return False, {}, "Google token expired."
+    except Exception:
+        return False, {}, "Google token expiry invalid."
+
+    return True, payload, ""
+
+@app.route('/auth/google/start')
+def google_start():
+    if not _google_auth_available(is_registration_enabled()):
+        flash("Google sign-in is not available.", "warning")
+        return redirect(url_for('login'))
+
+    state = secrets.token_urlsafe(32)
+    nonce = secrets.token_urlsafe(32)
+    session["google_oauth_state"] = state
+    session["google_oauth_nonce"] = nonce
+
+    params = {
+        "client_id": os.getenv("GOOGLE_CLIENT_ID", ""),
+        "redirect_uri": _google_redirect_uri(),
+        "response_type": "code",
+        "scope": "openid email profile",
+        "state": state,
+        "nonce": nonce,
+        "prompt": "select_account",
+    }
+    auth_url = f"https://accounts.google.com/o/oauth2/v2/auth?{urlencode(params)}"
+    return redirect(auth_url)
+
+@app.route('/auth/google/callback')
+def google_callback():
+    if not _google_auth_available(is_registration_enabled()):
+        flash("Google sign-in is not available.", "warning")
+        return redirect(url_for('login'))
+
+    state = request.args.get("state", "")
+    code = request.args.get("code", "")
+    expected_state = session.pop("google_oauth_state", None)
+    session.pop("google_oauth_nonce", None)
+    if not expected_state or not secrets.compare_digest(state, expected_state):
+        flash("OAuth state mismatch.", "danger")
+        return redirect(url_for('login'))
+    if not code:
+        flash("Missing authorization code.", "danger")
+        return redirect(url_for('login'))
+
+    token_url = "https://oauth2.googleapis.com/token"
+    token_payload = {
+        "code": code,
+        "client_id": os.getenv("GOOGLE_CLIENT_ID", ""),
+        "client_secret": os.getenv("GOOGLE_CLIENT_SECRET", ""),
+        "redirect_uri": _google_redirect_uri(),
+        "grant_type": "authorization_code",
+    }
+    try:
+        token_res = httpx.post(token_url, data=token_payload, timeout=10.0)
+    except Exception:
+        logger.exception("Google OAuth token exchange failed")
+        flash("Google token exchange failed.", "danger")
+        return redirect(url_for('login'))
+
+    if token_res.status_code != 200:
+        flash("Google token exchange failed.", "danger")
+        return redirect(url_for('login'))
+
+    token_data = token_res.json()
+    id_token = token_data.get("id_token", "")
+    ok, payload, error = _verify_google_id_token(id_token)
+    if not ok:
+        flash(error or "Google validation failed.", "danger")
+        return redirect(url_for('login'))
+
+    success, message = authenticate_google_user(payload.get("sub", ""), payload.get("email", ""))
+    if not success:
+        flash(message, "danger")
+        return redirect(url_for('login'))
+
+    flash(message, "success")
+    return redirect(url_for('dashboard'))
+
+
+@app.route('/login', methods=['GET', 'POST'])
+def login():
+    error_message = ""
+    form = LoginForm()
+    registration_enabled = is_registration_enabled()
+    google_auth_available = _google_auth_available(registration_enabled)
+    captcha_widget = _captcha_widget_html()
+
     if form.validate_on_submit():
         username = form.username.data
         password = form.password.data
-        invite_code = form.invite_code.data if not registration_enabled else None
 
         if _captcha_enabled() and not _captcha_ok():
             token = _captcha_token_from_request()
-            ok, err = verify_captcha_sync(token, remoteip=request.remote_addr or "", action="register")
+            ok, err = verify_captcha_sync(token, remoteip=request.remote_addr or "", action="login")
             if not ok:
                 error_message = err or "Captcha verification failed."
             else:
                 _set_captcha_ok()
 
-        if not error_message:
-            success, message = register_user(username, password, invite_code, email=email)
-            if success:
-                flash(message, "success")
-                return redirect(url_for('login'))
-            error_message = message
+        if not error_message and authenticate_user(username, password):
+            session['username'] = normalize_username(username)
+            return redirect(url_for('dashboard'))
+        elif not error_message:
+            error_message = "Signal mismatch. Your credentials did not align with the vault."
 
     return render_template_string("""
 <!DOCTYPE html>
@@ -10756,11 +14213,22 @@ def settings():
             {% else %}
                 <span class="badge badge-off">DISABLED</span>
             {% endif %}
-            <small style="opacity:.8;">(from ENV: REGISTRATION_ENABLED={{ registration_env_value }})</small>
-        </div>
-
-        <div class="alert-info">
-            Registration is controlled via environment only. Set <code>REGISTRATION_ENABLED=true</code> or <code>false</code> and restart the app.
+            <form method="POST" novalidate>
+                {{ form.hidden_tag() }}
+                <div class="form-group">
+                    {{ form.username.label }}
+                    {{ form.username(class="form-control", placeholder="Enter your username") }}
+                </div>
+                <div class="form-group">
+                    {{ form.password.label }}
+                    {{ form.password(class="form-control", placeholder="Enter your password") }}
+                </div>
+                {{ form.submit(class="btn btn-primary btn-block") }}
+            </form>
+            {% if google_auth_available %}
+            <a class="btn btn-light btn-block mt-3" href="{{ url_for('google_start') }}">Continue with Google</a>
+            {% endif %}
+            <p class="mt-3 text-center">Don't have an account? <a href="{{ url_for('register') }}">Register here</a></p>
         </div>
 
         {% if message %}
@@ -10796,6 +14264,1169 @@ def settings():
     <script src="{{ url_for('static', filename='js/bootstrap.min.js') }}"
             integrity="sha256-ecWZ3XYM7AwWIaGvSdmipJ2l1F4bN9RXW6zgpeAiZYI=" crossorigin="anonymous"></script>
 
+</body>
+</html>
+    """, form=form, error_message=error_message, registration_enabled=registration_enabled,
+       google_auth_available=google_auth_available, captcha_widget=captcha_widget, password_requirements=PASSWORD_REQUIREMENTS_TEXT)
+
+@app.route('/register', methods=['GET', 'POST'])
+def register():
+    registration_enabled = is_registration_enabled()
+    google_auth_available = _google_auth_available(registration_enabled)
+    captcha_widget = _captcha_widget_html()
+
+    error_message = ""
+    form = RegisterForm()
+    try:
+        if request.method == 'GET':
+            hinted = request.args.get('email','').strip()
+            if hinted and not form.email.data:
+                form.email.data = hinted
+    except Exception:
+        pass
+    if form.validate_on_submit():
+        username = form.username.data
+        password = form.password.data
+        invite_code = form.invite_code.data if not registration_enabled else None
+
+        if _captcha_enabled() and not _captcha_ok():
+            token = _captcha_token_from_request()
+            ok, err = verify_captcha_sync(token, remoteip=request.remote_addr or "", action="register")
+            if not ok:
+                error_message = err or "Captcha verification failed."
+            else:
+                _set_captcha_ok()
+
+        if not error_message:
+            success, message = register_user(username, password, invite_code, email=email)
+            if success:
+                flash(message, "success")
+                return redirect(url_for('login'))
+            error_message = message
+
+
+@app.route('/view_report/<int:report_id>', methods=['GET'])
+def view_report(report_id):
+    if 'username' not in session:
+        logger.warning(
+            f"Unauthorized access attempt to view_report by user: {session.get('username')}"
+        )
+        return redirect(url_for('login'))
+
+    user_id = get_user_id(session['username'])
+    report = get_hazard_report_by_id(report_id, user_id)
+    if not report:
+        logger.error(
+            f"Report not found or access denied for report_id: {report_id} by user_id: {user_id}"
+        )
+        return "Report not found or access denied.", 404
+
+    trigger_words = {
+        'severity': {
+            'low': -7,
+            'medium': -0.2,
+            'high': 14
+        },
+        'urgency': {
+            'level': {
+                'high': 14
+            }
+        },
+        'low': -7,
+        'medium': -0.2,
+        'metal': 11,
+    }
+
+    text = (report['result'] or "").lower()
+    words = re.findall(r'\w+', text)
+
+    total_weight = 0
+    for w in words:
+        if w in trigger_words.get('severity', {}):
+            total_weight += trigger_words['severity'][w]
+        elif w == 'metal':
+            total_weight += trigger_words['metal']
+
+    if 'urgency level' in text and 'high' in text:
+        total_weight += trigger_words['urgency']['level']['high']
+
+    max_factor = 30.0
+    if total_weight <= 0:
+        ratio = 0.0
+    else:
+        ratio = min(total_weight / max_factor, 1.0)
+
+    # If local llama is used and it produced a one-word risk label, map directly to the wheel.
+    try:
+        if (report.get("model_used") == "llama_local"):
+            lbl = (text or "").strip()
+            if lbl == "low":
+                ratio = 0.20
+            elif lbl == "medium":
+                ratio = 0.55
+            elif lbl == "high":
+                ratio = 0.90
+    except Exception:
+        pass
+
+    def interpolate_color(color1, color2, t):
+        c1 = int(color1[1:], 16)
+        c2 = int(color2[1:], 16)
+        r1, g1, b1 = (c1 >> 16) & 0xff, (c1 >> 8) & 0xff, c1 & 0xff
+        r2, g2, b2 = (c2 >> 16) & 0xff, (c2 >> 8) & 0xff, c2 & 0xff
+        r = int(r1 + (r2 - r1) * t)
+        g = int(g1 + (g2 - g1) * t)
+        b = int(b1 + (b2 - b1) * t)
+        return f"#{r:02x}{g:02x}{b:02x}"
+
+    green = "#56ab2f"
+    yellow = "#f4c95d"
+    red = "#ff9068"
+
+    if ratio < 0.5:
+        t = ratio / 0.5
+        wheel_color = interpolate_color(green, yellow, t)
+    else:
+        t = (ratio - 0.5) / 0.5
+        wheel_color = interpolate_color(yellow, red, t)
+
+    report_md = markdown(report['result'])
+    allowed_tags = list(bleach.sanitizer.ALLOWED_TAGS) + [
+        'p', 'ul', 'ol', 'li', 'strong', 'em', 'h1', 'h2', 'h3', 'h4', 'h5',
+        'h6', 'br'
+    ]
+    report_html = bleach.clean(report_md, tags=allowed_tags)
+    report_html_escaped = report_html.replace('\\', '\\\\')
+    csrf_token = generate_csrf()
+
+    return render_template_string(r"""
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Report Details</title>
+    <style>
+        #view-report-container .btn-custom {
+            width: 100%;
+            padding: 15px;
+            font-size: 1.2rem;
+            background-color: #007bff;
+            border: none;
+            color: #ffffff;
+            border-radius: 5px;
+            transition: background-color 0.3s;
+        }
+        #view-report-container .btn-custom:hover {
+            background-color: #0056b3;
+        }
+        #view-report-container .btn-danger {
+            width: 100%;
+            padding: 10px;
+            font-size: 1rem;
+        }
+
+        .hazard-wheel {
+            display: inline-block;
+            width: 320px; 
+            height: 320px; 
+            border-radius: 50%;
+            margin-right: 8px;
+            box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+            border: 2px solid #ffffff;
+            background: {{ wheel_color }};
+            background-size: cover;
+            vertical-align: middle;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            color: #ffffff;
+            font-weight: bold;
+            font-size: 1.2rem;
+            text-transform: capitalize;
+            margin: auto;
+            animation: breathing 3s infinite ease-in-out; /* Breathing animation */
+        }
+
+        @keyframes breathing {
+            0% { transform: scale(1); }
+            50% { transform: scale(1.1); }
+            100% { transform: scale(1); }
+        }
+
+        .hazard-summary {
+            text-align: center;
+            margin-top: 20px;
+        }
+    </style>
+</head>
+<body>
+    
+    <nav class="navbar navbar-expand-lg navbar-dark">
+        <a class="navbar-brand" href="{{ url_for('home') }}">QRS</a>
+        <button class="navbar-toggler" type="button" data-toggle="collapse" data-target="#navbarNav"
+            aria-controls="navbarNav" aria-expanded="false" aria-label="Toggle navigation">
+            <span class="navbar-toggler-icon"></span>
+        </button>
+
+        <div class="collapse navbar-collapse justify-content-end" id="navbarNav">
+            <ul class="navbar-nav">
+                <li class="nav-item"><a class="nav-link" href="{{ url_for('login') }}">Login</a></li>
+                <li class="nav-item"><a class="nav-link active" href="{{ url_for('register') }}">Register</a></li>
+            </ul>
+        </div>
+    </nav>
+
+    <div class="container">
+        <div class="walkd shadow">
+            <div class="brand">QRS</div>
+            <h3 class="text-center">Register</h3>
+            {% if error_message %}
+            <p class="error-message text-center">{{ error_message }}</p>
+            {% endif %}
+            <form method="POST" novalidate>
+                {{ form.hidden_tag() }}
+                <div class="form-group">
+                    {{ form.username.label }}
+                    {{ form.username(class="form-control", placeholder="Choose a username") }}
+                </div>
+                <div class="form-group">
+                    {{ form.password.label }}
+                    {{ form.password(class="form-control", placeholder="Choose a password") }}
+                    <small id="passwordStrength" class="form-text">{{ password_requirements }}</small>
+                </div>
+                {% if not registration_enabled %}
+                <div class="form-group">
+                    {{ form.invite_code.label }}
+                    {{ form.invite_code(class="form-control", placeholder="Enter invite code") }}
+                </div>
+            </div>
+            <div id="reportMarkdown">{{ report_html_escaped | safe }}</div>
+            <h4>Route Details</h4>
+            <p><span class="report-text-bold">Date:</span> {{ report['timestamp'] }}</p>
+            <p><span class="report-text-bold">Location:</span> {{ report['latitude'] }}, {{ report['longitude'] }}</p>
+            <p><span class="report-text-bold">Nearest City:</span> {{ report['street_name'] }}</p>
+            <p><span class="report-text-bold">Vehicle Type:</span> {{ report['vehicle_type'] }}</p>
+            <p><span class="report-text-bold">Destination:</span> {{ report['destination'] }}</p>
+            <p><span class="report-text-bold">Model Used:</span> {{ report['model_used'] }}</p>
+            <div aria-live="polite" aria-atomic="true" id="speechStatus" class="sr-only">
+                Speech synthesis is not active.
+            </div>
+        </div>
+    </div>
+</div>
+<script>
+    let synth = window.speechSynthesis;
+    let utterances = [];
+    let currentUtteranceIndex = 0;
+    let isSpeaking = false;
+    let availableVoices = [];
+    let selectedVoice = null;
+    let voicesLoaded = false;
+    let originalReportHTML = null;
+
+    <script>
+    document.addEventListener('DOMContentLoaded', function () {
+        var toggler = document.querySelector('.navbar-toggler');
+        var nav = document.getElementById('navbarNav');
+        if (toggler && nav) {
+            toggler.addEventListener('click', function () {
+                var isShown = nav.classList.toggle('show');
+                toggler.setAttribute('aria-expanded', isShown ? 'true' : 'false');
+            });
+        }
+    });
+    
+    // Create strong password helper (client-side convenience)
+    (function(){
+      function randChar(set){
+        const a = new Uint32Array(1);
+        (window.crypto||window.msCrypto).getRandomValues(a);
+        return set[a[0] % set.length];
+      }
+      function gen(len){
+        const U="ABCDEFGHJKLMNPQRSTUVWXYZ";
+        const L="abcdefghijkmnopqrstuvwxyz";
+        const D="23456789";
+        const S="!@#$%^&*()-_=+[]{}:,.?/";
+        let out = randChar(U)+randChar(L)+randChar(D)+randChar(S);
+        const all=U+L+D+S;
+        for(let i=out.length;i<len;i++) out += randChar(all);
+        // shuffle
+        out = out.split('').sort(()=>{const a=new Uint32Array(1); crypto.getRandomValues(a); return (a[0] / 2**32)-0.5;}).join('');
+        return out;
+      }
+      const btn = document.getElementById('genPw');
+      if(!btn) return;
+      btn.addEventListener('click', ()=>{
+        const inp = document.getElementById('password');
+        if(!inp) return;
+        const pw = gen(24);
+        inp.value = pw;
+        inp.dispatchEvent(new Event('input', {bubbles:true}));
+        try{ inp.focus(); inp.setSelectionRange(0, pw.length); }catch(e){}
+      });
+    })();
+
+</script>
+</body>
+</html>
+    """, form=form, error_message=error_message, registration_enabled=registration_enabled,
+       google_auth_available=google_auth_available, captcha_widget=captcha_widget, password_requirements=PASSWORD_REQUIREMENTS_TEXT)
+
+@app.route('/settings', methods=['GET', 'POST'])
+def settings():
+    
+
+    import os  
+
+    if 'is_admin' not in session or not session.get('is_admin'):
+        return redirect(url_for('dashboard'))
+
+    message = ""
+    new_invite_code = None
+    form = SettingsForm()
+
+    
+    def _read_registration_from_env():
+        val = os.getenv('REGISTRATION_ENABLED', 'false')
+        return (val, str(val).strip().lower() in ('1', 'true', 'yes', 'on'))
+
+    env_val, registration_enabled = _read_registration_from_env()
+
+    if request.method == 'POST':
+        action = request.form.get('action')
+        if action == 'generate_invite_code':
+            new_invite_code = generate_secure_invite_code()
+            with db_connect(DB_FILE) as db:
+                cursor = db.cursor()
+                cursor.execute("INSERT INTO invite_codes (code) VALUES (?)",
+                               (new_invite_code,))
+                db.commit()
+            message = f"New invite code generated: {new_invite_code}"
+
+        
+        env_val, registration_enabled = _read_registration_from_env()
+
+   
+    invite_codes = []
+    with db_connect(DB_FILE) as db:
+        cursor = db.cursor()
+        cursor.execute("SELECT code FROM invite_codes WHERE is_used = 0")
+        invite_codes = [row[0] for row in cursor.fetchall()]
+
+
+def _verify_google_id_token(id_token: str) -> tuple[bool, dict[str, Any], str]:
+    if not id_token:
+        return False, {}, "Missing Google ID token."
+
+    tokeninfo_url = "https://oauth2.googleapis.com/tokeninfo"
+    try:
+        response = httpx.get(tokeninfo_url, params={"id_token": id_token}, timeout=8.0)
+    except Exception:
+        logger.exception("Google token validation request failed")
+        return False, {}, "Google verification failed."
+
+    if response.status_code != 200:
+        return False, {}, "Google verification failed."
+
+    payload = response.json()
+    aud = payload.get("aud", "")
+    sub = payload.get("sub", "")
+    email = payload.get("email", "")
+    email_verified = payload.get("email_verified", "false")
+    exp_raw = payload.get("exp", "0")
+
+    if aud != os.getenv("GOOGLE_CLIENT_ID", ""):
+        return False, {}, "Google audience mismatch."
+    if not sub:
+        return False, {}, "Google subject missing."
+    if str(email_verified).lower() not in ("true", "1"):
+        return False, {}, "Google email is not verified."
+    try:
+        if int(exp_raw) <= int(time.time()):
+            return False, {}, "Google token expired."
+    except Exception:
+        return False, {}, "Google token expiry invalid."
+
+    return True, payload, ""
+
+@app.route('/auth/google/start')
+def google_start():
+    if not _google_auth_available(is_registration_enabled()):
+        flash("Google sign-in is not available.", "warning")
+        return redirect(url_for('login'))
+
+    state = secrets.token_urlsafe(32)
+    nonce = secrets.token_urlsafe(32)
+    session["google_oauth_state"] = state
+    session["google_oauth_nonce"] = nonce
+
+    params = {
+        "client_id": os.getenv("GOOGLE_CLIENT_ID", ""),
+        "redirect_uri": _google_redirect_uri(),
+        "response_type": "code",
+        "scope": "openid email profile",
+        "state": state,
+        "nonce": nonce,
+        "prompt": "select_account",
+    }
+    auth_url = f"https://accounts.google.com/o/oauth2/v2/auth?{urlencode(params)}"
+    return redirect(auth_url)
+
+@app.route('/auth/google/callback')
+def google_callback():
+    if not _google_auth_available(is_registration_enabled()):
+        flash("Google sign-in is not available.", "warning")
+        return redirect(url_for('login'))
+
+    state = request.args.get("state", "")
+    code = request.args.get("code", "")
+    expected_state = session.pop("google_oauth_state", None)
+    session.pop("google_oauth_nonce", None)
+    if not expected_state or not secrets.compare_digest(state, expected_state):
+        flash("OAuth state mismatch.", "danger")
+        return redirect(url_for('login'))
+    if not code:
+        flash("Missing authorization code.", "danger")
+        return redirect(url_for('login'))
+
+    token_url = "https://oauth2.googleapis.com/token"
+    token_payload = {
+        "code": code,
+        "client_id": os.getenv("GOOGLE_CLIENT_ID", ""),
+        "client_secret": os.getenv("GOOGLE_CLIENT_SECRET", ""),
+        "redirect_uri": _google_redirect_uri(),
+        "grant_type": "authorization_code",
+    }
+    try:
+        token_res = httpx.post(token_url, data=token_payload, timeout=10.0)
+    except Exception:
+        logger.exception("Google OAuth token exchange failed")
+        flash("Google token exchange failed.", "danger")
+        return redirect(url_for('login'))
+
+    if token_res.status_code != 200:
+        flash("Google token exchange failed.", "danger")
+        return redirect(url_for('login'))
+
+    token_data = token_res.json()
+    id_token = token_data.get("id_token", "")
+    ok, payload, error = _verify_google_id_token(id_token)
+    if not ok:
+        flash(error or "Google validation failed.", "danger")
+        return redirect(url_for('login'))
+
+    success, message = authenticate_google_user(payload.get("sub", ""), payload.get("email", ""))
+    if not success:
+        flash(message, "danger")
+        return redirect(url_for('login'))
+
+    flash(message, "success")
+    return redirect(url_for('dashboard'))
+
+
+@app.route('/login', methods=['GET', 'POST'])
+def login():
+    error_message = ""
+    form = LoginForm()
+    registration_enabled = is_registration_enabled()
+    google_auth_available = _google_auth_available(registration_enabled)
+    captcha_widget = _captcha_widget_html()
+
+    if form.validate_on_submit():
+        username = form.username.data
+        password = form.password.data
+
+        if _captcha_enabled() and not _captcha_ok():
+            token = _captcha_token_from_request()
+            ok, err = verify_captcha_sync(token, remoteip=request.remote_addr or "", action="login")
+            if not ok:
+                error_message = err or "Captcha verification failed."
+            else:
+                _set_captcha_ok()
+
+        if not error_message and authenticate_user(username, password):
+            session['username'] = normalize_username(username)
+            return redirect(url_for('dashboard'))
+        elif not error_message:
+            error_message = "Signal mismatch. Your credentials did not align with the vault."
+
+    return render_template_string("""
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Settings - QRS</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1, shrink-to-fit=no">
+    <link href="{{ url_for('static', filename='css/bootstrap.min.css') }}" rel="stylesheet"
+          integrity="sha256-Ww++W3rXBfapN8SZitAvc9jw2Xb+Ixt0rvDsmWmQyTo=" crossorigin="anonymous">
+    <link href="{{ url_for('static', filename='css/roboto.css') }}" rel="stylesheet"
+          integrity="sha256-Sc7BtUKoWr6RBuNTT0MmuQjqGVQwYBK+21lB58JwUVE=" crossorigin="anonymous">
+    <link href="{{ url_for('static', filename='css/orbitron.css') }}" rel="stylesheet"
+          integrity="sha256-3mvPl5g2WhVLrUV4xX3KE8AV8FgrOz38KmWLqKXVh00" crossorigin="anonymous">
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/fontawesome.min.css') }}"
+          integrity="sha256-rx5u3IdaOCszi7Jb18XD9HSn8bNiEgAqWJbdBvIYYyU=" crossorigin="anonymous">
+    <style>
+        body { background:#121212; color:#fff; font-family:'Roboto',sans-serif; }
+        .sidebar { position:fixed; top:0; left:0; height:100%; width:220px; background:#1f1f1f; padding-top:60px; border-right:1px solid #333; transition:width .3s; }
+        .sidebar a { color:#bbb; padding:15px 20px; text-decoration:none; display:block; font-size:1rem; transition:background-color .3s, color .3s; }
+        .sidebar a:hover, .sidebar a.active { background:#333; color:#fff; }
+        .content { margin-left:220px; padding:20px; transition:margin-left .3s; }
+        .navbar-brand { font-size:1.5rem; color:#fff; text-align:center; display:block; margin-bottom:20px; font-family:'Orbitron',sans-serif; }
+        .card { padding:30px; background:rgba(255,255,255,.1); border:none; border-radius:15px; }
+        .message { color:#4dff4d; }
+        .status { margin:10px 0 20px; }
+        .badge { display:inline-block; padding:.35em .6em; border-radius:.35rem; font-weight:bold; }
+        .badge-ok { background:#00cc00; color:#000; }
+        .badge-off { background:#cc0000; color:#fff; }
+        .alert-info { background:#0d6efd22; border:1px solid #0d6efd66; color:#cfe2ff; padding:10px 12px; border-radius:8px; }
+        .btn { color:#fff; font-weight:bold; transition:background-color .3s, border-color .3s; }
+        .btn-primary { background:#007bff; border-color:#007bff; }
+        .btn-primary:hover { background:#0056b3; border-color:#0056b3; }
+        .invite-codes { margin-top:20px; }
+        .invite-code { background:#2c2c2c; padding:10px; border-radius:5px; margin-bottom:5px; font-family:'Courier New', Courier, monospace; }
+        @media (max-width:768px){ .sidebar{width:60px;} .sidebar a{padding:15px 10px; text-align:center;} .sidebar a span{display:none;} .content{margin-left:60px;} }
+    </style>
+</head>
+<body>
+
+    <div class="sidebar">
+        <div class="navbar-brand">QRS</div>
+        <a href="{{ url_for('dashboard') }}" class="nav-link {% if active_page == 'dashboard' %}active{% endif %}">
+            <i class="fas fa-home"></i> <span>Dashboard</span>
+        </a>
+        {% if session.get('is_admin') %}
+        <a href="{{ url_for('settings') }}" class="nav-link {% if active_page == 'settings' %}active{% endif %}">
+            <i class="fas fa-cogs"></i> <span>Settings</span>
+        </a>
+        {% endif %}
+        <a href="{{ url_for('logout') }}" class="nav-link">
+            <i class="fas fa-sign-out-alt"></i> <span>Logout</span>
+        </a>
+    </div>
+
+    <div class="content">
+        <h2>Settings</h2>
+
+        <div class="status">
+            <strong>Current registration:</strong>
+            {% if registration_enabled %}
+                <span class="badge badge-ok">ENABLED</span>
+            {% else %}
+                <span class="badge badge-off">DISABLED</span>
+            {% endif %}
+            <small style="opacity:.8;">(from ENV: REGISTRATION_ENABLED={{ registration_env_value }})</small>
+        </div>
+
+        <div class="alert-info">
+            Registration is controlled via environment only. Set <code>REGISTRATION_ENABLED=true</code> or <code>false</code> and restart the app.
+        </div>
+
+        const reportContentElement = document.getElementById('reportMarkdown');
+        const reportContent = reportContentElement.innerText;
+        const routeDetails = `
+            Date: {{ report['timestamp'] }}.
+            Location: {{ report['latitude'] }}, {{ report['longitude'] }}.
+            Nearest City: {{ report['street_name'] }}.
+            Vehicle Type: {{ report['vehicle_type'] }}.
+            Destination: {{ report['destination'] }}.
+            Model Used: {{ report['model_used'] }}.
+        `;
+        const combinedText = preprocessText(reportContent + ' ' + routeDetails);
+        const sentences = splitIntoSentences(combinedText);
+
+        initializeProgressBar(sentences.length);
+        updateSpeechStatus('in progress');
+        synth.cancel();
+        utterances = [];
+        currentUtteranceIndex = 0;
+        isSpeaking = true;
+
+        sentences.forEach((sentence) => {
+            const utterance = new SpeechSynthesisUtterance(sentence.trim());
+            adjustSpeechParameters(utterance, sentence);
+            utterance.volume = 1;
+            utterance.voice = selectedVoice;
+
+            utterance.onend = () => {
+                updateProgressBar();
+                currentUtteranceIndex++;
+                if (currentUtteranceIndex < utterances.length) {
+                    synth.speak(utterances[currentUtteranceIndex]);
+                } else {
+                    isSpeaking = false;
+                    updateSpeechStatus('not active');
+                }
+            };
+            utterance.onerror = (event) => {
+                console.error('SpeechSynthesisUtterance.onerror', event);
+                alert("Speech has stopped");
+                isSpeaking = false;
+                updateSpeechStatus('not active');
+            };
+            utterances.push(utterance);
+        });
+
+        if (utterances.length > 0) {
+            synth.speak(utterances[0]);
+        }
+    }
+
+    function stopSpeech() {
+        if (synth.speaking) {
+            synth.cancel();
+        }
+        utterances = [];
+        currentUtteranceIndex = 0;
+        isSpeaking = false;
+        updateSpeechStatus('not active');
+    }
+
+    document.addEventListener('keydown', function(event) {
+        if (event.ctrlKey && event.altKey && event.key.toLowerCase() === 'r') {
+            readAloud();
+        }
+        if (event.ctrlKey && event.altKey && event.key.toLowerCase() === 's') {
+            stopSpeech();
+        }
+    </style>
+</head>
+<body>
+    <nav class="navbar navbar-expand-lg navbar-dark">
+        <a class="navbar-brand" href="{{ url_for('home') }}">QRS</a>
+        <button class="navbar-toggler" type="button" data-toggle="collapse" data-target="#navbarNav" 
+            aria-controls="navbarNav" aria-expanded="false" aria-label="Toggle navigation">
+            <span class="navbar-toggler-icon"></span>
+        </button>
+
+        <!-- Right side: ONLY Login / Register (no Dashboard, no dropdown) -->
+        <div class="collapse navbar-collapse justify-content-end" id="navbarNav">
+            <ul class="navbar-nav">
+                <li class="nav-item"><a class="nav-link active" href="{{ url_for('login') }}">Login</a></li>
+                <li class="nav-item"><a class="nav-link" href="{{ url_for('register') }}">Register</a></li>
+            </ul>
+        </div>
+    </nav>
+
+    <div class="container">
+        <div class="Spotd shadow">
+            <div class="brand">QRS</div>
+            <h3 class="text-center">Login</h3>
+            {% if error_message %}
+            <p class="error-message text-center">{{ error_message }}</p>
+            {% endif %}
+            <form method="POST" novalidate>
+                {{ form.hidden_tag() }}
+                <div class="form-group">
+                    {{ form.username.label }}
+                    {{ form.username(class="form-control", placeholder="Enter your username") }}
+                </div>
+                <div class="form-group">
+                    {{ form.password.label }}
+                    {{ form.password(class="form-control", placeholder="Enter your password") }}
+                </div>
+                {{ form.submit(class="btn btn-primary btn-block") }}
+            </form>
+            {% if google_auth_available %}
+            <a class="btn btn-light btn-block mt-3" href="{{ url_for('google_start') }}">Continue with Google</a>
+            {% endif %}
+            <p class="mt-3 text-center">Don't have an account? <a href="{{ url_for('register') }}">Register here</a></p>
+        </div>
+    </div>
+
+    window.addEventListener('touchstart', () => {
+        if (!voicesLoaded) {
+            preloadVoices().catch(e => console.error(e));
+        }
+    }, { once: true });
+</script>
+</body>
+</html>
+    """, form=form, error_message=error_message, registration_enabled=registration_enabled,
+       google_auth_available=google_auth_available, captcha_widget=captcha_widget, password_requirements=PASSWORD_REQUIREMENTS_TEXT)
+
+@app.route('/register', methods=['GET', 'POST'])
+def register():
+    registration_enabled = is_registration_enabled()
+    google_auth_available = _google_auth_available(registration_enabled)
+    captcha_widget = _captcha_widget_html()
+
+    error_message = ""
+    form = RegisterForm()
+    try:
+        if request.method == 'GET':
+            hinted = request.args.get('email','').strip()
+            if hinted and not form.email.data:
+                form.email.data = hinted
+    except Exception:
+        pass
+    if form.validate_on_submit():
+        username = form.username.data
+        password = form.password.data
+        invite_code = form.invite_code.data if not registration_enabled else None
+
+        if _captcha_enabled() and not _captcha_ok():
+            token = _captcha_token_from_request()
+            ok, err = verify_captcha_sync(token, remoteip=request.remote_addr or "", action="register")
+            if not ok:
+                error_message = err or "Captcha verification failed."
+            else:
+                _set_captcha_ok()
+
+        if not error_message:
+            success, message = register_user(username, password, invite_code, email=email)
+            if success:
+                flash(message, "success")
+                return redirect(url_for('login'))
+            error_message = message
+
+
+@app.route('/view_report/<int:report_id>', methods=['GET'])
+def view_report(report_id):
+    if 'username' not in session:
+        logger.warning(
+            f"Unauthorized access attempt to view_report by user: {session.get('username')}"
+        )
+        return redirect(url_for('login'))
+
+    user_id = get_user_id(session['username'])
+    report = get_hazard_report_by_id(report_id, user_id)
+    if not report:
+        logger.error(
+            f"Report not found or access denied for report_id: {report_id} by user_id: {user_id}"
+        )
+        return "Report not found or access denied.", 404
+
+    trigger_words = {
+        'severity': {
+            'low': -7,
+            'medium': -0.2,
+            'high': 14
+        },
+        'urgency': {
+            'level': {
+                'high': 14
+            }
+        },
+        'low': -7,
+        'medium': -0.2,
+        'metal': 11,
+    }
+
+    text = (report['result'] or "").lower()
+    words = re.findall(r'\w+', text)
+
+    total_weight = 0
+    for w in words:
+        if w in trigger_words.get('severity', {}):
+            total_weight += trigger_words['severity'][w]
+        elif w == 'metal':
+            total_weight += trigger_words['metal']
+
+    if 'urgency level' in text and 'high' in text:
+        total_weight += trigger_words['urgency']['level']['high']
+
+    max_factor = 30.0
+    if total_weight <= 0:
+        ratio = 0.0
+    else:
+        ratio = min(total_weight / max_factor, 1.0)
+
+    # If local llama is used and it produced a one-word risk label, map directly to the wheel.
+    try:
+        if (report.get("model_used") == "llama_local"):
+            lbl = (text or "").strip()
+            if lbl == "low":
+                ratio = 0.20
+            elif lbl == "medium":
+                ratio = 0.55
+            elif lbl == "high":
+                ratio = 0.90
+    except Exception:
+        pass
+
+    def interpolate_color(color1, color2, t):
+        c1 = int(color1[1:], 16)
+        c2 = int(color2[1:], 16)
+        r1, g1, b1 = (c1 >> 16) & 0xff, (c1 >> 8) & 0xff, c1 & 0xff
+        r2, g2, b2 = (c2 >> 16) & 0xff, (c2 >> 8) & 0xff, c2 & 0xff
+        r = int(r1 + (r2 - r1) * t)
+        g = int(g1 + (g2 - g1) * t)
+        b = int(b1 + (b2 - b1) * t)
+        return f"#{r:02x}{g:02x}{b:02x}"
+
+    green = "#56ab2f"
+    yellow = "#f4c95d"
+    red = "#ff9068"
+
+    if ratio < 0.5:
+        t = ratio / 0.5
+        wheel_color = interpolate_color(green, yellow, t)
+    else:
+        t = (ratio - 0.5) / 0.5
+        wheel_color = interpolate_color(yellow, red, t)
+
+    report_md = markdown(report['result'])
+    allowed_tags = list(bleach.sanitizer.ALLOWED_TAGS) + [
+        'p', 'ul', 'ol', 'li', 'strong', 'em', 'h1', 'h2', 'h3', 'h4', 'h5',
+        'h6', 'br'
+    ]
+    report_html = bleach.clean(report_md, tags=allowed_tags)
+    report_html_escaped = report_html.replace('\\', '\\\\')
+    csrf_token = generate_csrf()
+
+    return render_template_string(r"""
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Report Details</title>
+    <style>
+        #view-report-container .btn-custom {
+            width: 100%;
+            padding: 15px;
+            font-size: 1.2rem;
+            background-color: #007bff;
+            border: none;
+            color: #ffffff;
+            border-radius: 5px;
+            transition: background-color 0.3s;
+        }
+        #view-report-container .btn-custom:hover {
+            background-color: #0056b3;
+        }
+        #view-report-container .btn-danger {
+            width: 100%;
+            padding: 10px;
+            font-size: 1rem;
+        }
+
+        .hazard-wheel {
+            display: inline-block;
+            width: 320px; 
+            height: 320px; 
+            border-radius: 50%;
+            margin-right: 8px;
+            box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+            border: 2px solid #ffffff;
+            background: {{ wheel_color }};
+            background-size: cover;
+            vertical-align: middle;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            color: #ffffff;
+            font-weight: bold;
+            font-size: 1.2rem;
+            text-transform: capitalize;
+            margin: auto;
+            animation: breathing 3s infinite ease-in-out; /* Breathing animation */
+        }
+
+        @keyframes breathing {
+            0% { transform: scale(1); }
+            50% { transform: scale(1.1); }
+            100% { transform: scale(1); }
+        }
+
+        .hazard-summary {
+            text-align: center;
+            margin-top: 20px;
+        }
+    </style>
+</head>
+<body>
+    
+    <nav class="navbar navbar-expand-lg navbar-dark">
+        <a class="navbar-brand" href="{{ url_for('home') }}">QRS</a>
+        <button class="navbar-toggler" type="button" data-toggle="collapse" data-target="#navbarNav"
+            aria-controls="navbarNav" aria-expanded="false" aria-label="Toggle navigation">
+            <span class="navbar-toggler-icon"></span>
+        </button>
+
+        <div class="collapse navbar-collapse justify-content-end" id="navbarNav">
+            <ul class="navbar-nav">
+                <li class="nav-item"><a class="nav-link" href="{{ url_for('login') }}">Login</a></li>
+                <li class="nav-item"><a class="nav-link active" href="{{ url_for('register') }}">Register</a></li>
+            </ul>
+        </div>
+    </nav>
+
+    <div class="container">
+        <div class="walkd shadow">
+            <div class="brand">QRS</div>
+            <h3 class="text-center">Register</h3>
+            {% if error_message %}
+            <p class="error-message text-center">{{ error_message }}</p>
+            {% endif %}
+            <form method="POST" novalidate>
+                {{ form.hidden_tag() }}
+                <div class="form-group">
+                    {{ form.username.label }}
+                    {{ form.username(class="form-control", placeholder="Choose a username") }}
+                </div>
+                <div class="form-group">
+                    {{ form.password.label }}
+                    {{ form.password(class="form-control", placeholder="Choose a password") }}
+                    <small id="passwordStrength" class="form-text">{{ password_requirements }}</small>
+                </div>
+                {% if not registration_enabled %}
+                <div class="form-group">
+                    {{ form.invite_code.label }}
+                    {{ form.invite_code(class="form-control", placeholder="Enter invite code") }}
+                </div>
+            </div>
+            <div id="reportMarkdown">{{ report_html_escaped | safe }}</div>
+            <h4>Route Details</h4>
+            <p><span class="report-text-bold">Date:</span> {{ report['timestamp'] }}</p>
+            <p><span class="report-text-bold">Location:</span> {{ report['latitude'] }}, {{ report['longitude'] }}</p>
+            <p><span class="report-text-bold">Nearest City:</span> {{ report['street_name'] }}</p>
+            <p><span class="report-text-bold">Vehicle Type:</span> {{ report['vehicle_type'] }}</p>
+            <p><span class="report-text-bold">Destination:</span> {{ report['destination'] }}</p>
+            <p><span class="report-text-bold">Model Used:</span> {{ report['model_used'] }}</p>
+            <div aria-live="polite" aria-atomic="true" id="speechStatus" class="sr-only">
+                Speech synthesis is not active.
+            </div>
+        </div>
+    </div>
+</div>
+<script>
+    let synth = window.speechSynthesis;
+    let utterances = [];
+    let currentUtteranceIndex = 0;
+    let isSpeaking = false;
+    let availableVoices = [];
+    let selectedVoice = null;
+    let voicesLoaded = false;
+    let originalReportHTML = null;
+
+    <script>
+    document.addEventListener('DOMContentLoaded', function () {
+        var toggler = document.querySelector('.navbar-toggler');
+        var nav = document.getElementById('navbarNav');
+        if (toggler && nav) {
+            toggler.addEventListener('click', function () {
+                var isShown = nav.classList.toggle('show');
+                toggler.setAttribute('aria-expanded', isShown ? 'true' : 'false');
+            });
+        }
+    });
+    
+    // Create strong password helper (client-side convenience)
+    (function(){
+      function randChar(set){
+        const a = new Uint32Array(1);
+        (window.crypto||window.msCrypto).getRandomValues(a);
+        return set[a[0] % set.length];
+      }
+      function gen(len){
+        const U="ABCDEFGHJKLMNPQRSTUVWXYZ";
+        const L="abcdefghijkmnopqrstuvwxyz";
+        const D="23456789";
+        const S="!@#$%^&*()-_=+[]{}:,.?/";
+        let out = randChar(U)+randChar(L)+randChar(D)+randChar(S);
+        const all=U+L+D+S;
+        for(let i=out.length;i<len;i++) out += randChar(all);
+        // shuffle
+        out = out.split('').sort(()=>{const a=new Uint32Array(1); crypto.getRandomValues(a); return (a[0] / 2**32)-0.5;}).join('');
+        return out;
+      }
+      const btn = document.getElementById('genPw');
+      if(!btn) return;
+      btn.addEventListener('click', ()=>{
+        const inp = document.getElementById('password');
+        if(!inp) return;
+        const pw = gen(24);
+        inp.value = pw;
+        inp.dispatchEvent(new Event('input', {bubbles:true}));
+        try{ inp.focus(); inp.setSelectionRange(0, pw.length); }catch(e){}
+      });
+    })();
+
+</script>
+</body>
+</html>
+    """, form=form, error_message=error_message, registration_enabled=registration_enabled,
+       google_auth_available=google_auth_available, captcha_widget=captcha_widget, password_requirements=PASSWORD_REQUIREMENTS_TEXT)
+
+@app.route('/settings', methods=['GET', 'POST'])
+def settings():
+    
+
+    import os  
+
+    if 'is_admin' not in session or not session.get('is_admin'):
+        return redirect(url_for('dashboard'))
+
+    message = ""
+    new_invite_code = None
+    form = SettingsForm()
+
+    
+    def _read_registration_from_env():
+        val = os.getenv('REGISTRATION_ENABLED', 'false')
+        return (val, str(val).strip().lower() in ('1', 'true', 'yes', 'on'))
+
+    env_val, registration_enabled = _read_registration_from_env()
+
+    if request.method == 'POST':
+        action = request.form.get('action')
+        if action == 'generate_invite_code':
+            new_invite_code = generate_secure_invite_code()
+            with db_connect(DB_FILE) as db:
+                cursor = db.cursor()
+                cursor.execute("INSERT INTO invite_codes (code) VALUES (?)",
+                               (new_invite_code,))
+                db.commit()
+            message = f"New invite code generated: {new_invite_code}"
+
+        
+        env_val, registration_enabled = _read_registration_from_env()
+
+   
+    invite_codes = []
+    with db_connect(DB_FILE) as db:
+        cursor = db.cursor()
+        cursor.execute("SELECT code FROM invite_codes WHERE is_used = 0")
+        invite_codes = [row[0] for row in cursor.fetchall()]
+
+    return render_template_string("""
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Settings - QRS</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1, shrink-to-fit=no">
+    <link href="{{ url_for('static', filename='css/bootstrap.min.css') }}" rel="stylesheet"
+          integrity="sha256-Ww++W3rXBfapN8SZitAvc9jw2Xb+Ixt0rvDsmWmQyTo=" crossorigin="anonymous">
+    <link href="{{ url_for('static', filename='css/roboto.css') }}" rel="stylesheet"
+          integrity="sha256-Sc7BtUKoWr6RBuNTT0MmuQjqGVQwYBK+21lB58JwUVE=" crossorigin="anonymous">
+    <link href="{{ url_for('static', filename='css/orbitron.css') }}" rel="stylesheet"
+          integrity="sha256-3mvPl5g2WhVLrUV4xX3KE8AV8FgrOz38KmWLqKXVh00" crossorigin="anonymous">
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/fontawesome.min.css') }}"
+          integrity="sha256-rx5u3IdaOCszi7Jb18XD9HSn8bNiEgAqWJbdBvIYYyU=" crossorigin="anonymous">
+    <style>
+        body { background:#121212; color:#fff; font-family:'Roboto',sans-serif; }
+        .sidebar { position:fixed; top:0; left:0; height:100%; width:220px; background:#1f1f1f; padding-top:60px; border-right:1px solid #333; transition:width .3s; }
+        .sidebar a { color:#bbb; padding:15px 20px; text-decoration:none; display:block; font-size:1rem; transition:background-color .3s, color .3s; }
+        .sidebar a:hover, .sidebar a.active { background:#333; color:#fff; }
+        .content { margin-left:220px; padding:20px; transition:margin-left .3s; }
+        .navbar-brand { font-size:1.5rem; color:#fff; text-align:center; display:block; margin-bottom:20px; font-family:'Orbitron',sans-serif; }
+        .card { padding:30px; background:rgba(255,255,255,.1); border:none; border-radius:15px; }
+        .message { color:#4dff4d; }
+        .status { margin:10px 0 20px; }
+        .badge { display:inline-block; padding:.35em .6em; border-radius:.35rem; font-weight:bold; }
+        .badge-ok { background:#00cc00; color:#000; }
+        .badge-off { background:#cc0000; color:#fff; }
+        .alert-info { background:#0d6efd22; border:1px solid #0d6efd66; color:#cfe2ff; padding:10px 12px; border-radius:8px; }
+        .btn { color:#fff; font-weight:bold; transition:background-color .3s, border-color .3s; }
+        .btn-primary { background:#007bff; border-color:#007bff; }
+        .btn-primary:hover { background:#0056b3; border-color:#0056b3; }
+        .invite-codes { margin-top:20px; }
+        .invite-code { background:#2c2c2c; padding:10px; border-radius:5px; margin-bottom:5px; font-family:'Courier New', Courier, monospace; }
+        @media (max-width:768px){ .sidebar{width:60px;} .sidebar a{padding:15px 10px; text-align:center;} .sidebar a span{display:none;} .content{margin-left:60px;} }
+    </style>
+</head>
+<body>
+
+    <div class="sidebar">
+        <div class="navbar-brand">QRS</div>
+        <a href="{{ url_for('dashboard') }}" class="nav-link {% if active_page == 'dashboard' %}active{% endif %}">
+            <i class="fas fa-home"></i> <span>Dashboard</span>
+        </a>
+        {% if session.get('is_admin') %}
+        <a href="{{ url_for('settings') }}" class="nav-link {% if active_page == 'settings' %}active{% endif %}">
+            <i class="fas fa-cogs"></i> <span>Settings</span>
+        </a>
+        {% endif %}
+        <a href="{{ url_for('logout') }}" class="nav-link">
+            <i class="fas fa-sign-out-alt"></i> <span>Logout</span>
+        </a>
+    </div>
+
+    <div class="content">
+        <h2>Settings</h2>
+
+        <div class="status">
+            <strong>Current registration:</strong>
+            {% if registration_enabled %}
+                <span class="badge badge-ok">ENABLED</span>
+            {% else %}
+                <span class="badge badge-off">DISABLED</span>
+            {% endif %}
+            <small style="opacity:.8;">(from ENV: REGISTRATION_ENABLED={{ registration_env_value }})</small>
+        </div>
+
+        <div class="alert-info">
+            Registration is controlled via environment only. Set <code>REGISTRATION_ENABLED=true</code> or <code>false</code> and restart the app.
+        </div>
+
+        {% if message %}
+            <p class="message">{{ message }}</p>
+        {% endif %}
+
+        initializeProgressBar(sentences.length);
+        updateSpeechStatus('in progress');
+        synth.cancel();
+        utterances = [];
+        currentUtteranceIndex = 0;
+        isSpeaking = true;
+
+        sentences.forEach((sentence) => {
+            const utterance = new SpeechSynthesisUtterance(sentence.trim());
+            adjustSpeechParameters(utterance, sentence);
+            utterance.volume = 1;
+            utterance.voice = selectedVoice;
+
+            utterance.onend = () => {
+                updateProgressBar();
+                currentUtteranceIndex++;
+                if (currentUtteranceIndex < utterances.length) {
+                    synth.speak(utterances[currentUtteranceIndex]);
+                } else {
+                    isSpeaking = false;
+                    updateSpeechStatus('not active');
+                }
+            };
+            utterance.onerror = (event) => {
+                console.error('SpeechSynthesisUtterance.onerror', event);
+                alert("Speech has stopped");
+                isSpeaking = false;
+                updateSpeechStatus('not active');
+            };
+            utterances.push(utterance);
+        });
+
+        if (utterances.length > 0) {
+            synth.speak(utterances[0]);
+        }
+    }
+
+    function stopSpeech() {
+        if (synth.speaking) {
+            synth.cancel();
+        }
+        utterances = [];
+        currentUtteranceIndex = 0;
+        isSpeaking = false;
+        updateSpeechStatus('not active');
+    }
+
+    document.addEventListener('keydown', function(event) {
+        if (event.ctrlKey && event.altKey && event.key.toLowerCase() === 'r') {
+            readAloud();
+        }
+        if (event.ctrlKey && event.altKey && event.key.toLowerCase() === 's') {
+            stopSpeech();
+        }
+    });
+
+    window.addEventListener('touchstart', () => {
+        if (!voicesLoaded) {
+            preloadVoices().catch(e => console.error(e));
+        }
+    }, { once: true });
+</script>
 </body>
 </html>
     """,
@@ -13032,6 +17663,16 @@ async def api_scan():
             _cdb.commit()
             return jsonify(cached), 200
 
+    result, cpu_usage, ram_usage, quantum_results, street_name, model_used = await scan_debris_for_route(
+        lat_float, lon_float, vehicle_type, destination, user_id, selected_model=model_selection
+    )
+    harm_level = calculate_harm_level(result)
+    report_id = save_hazard_report(
+        lat_float, lon_float, street_name,
+        vehicle_type, destination, result,
+        cpu_usage, ram_usage, quantum_results,
+        user_id, harm_level, model_used
+    )
 
     combined_input = f"Vehicle Type: {vehicle_type}\nDestination: {destination}"
     is_allowed, analysis = await phf_filter_input(combined_input)
