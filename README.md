@@ -1,211 +1,214 @@
-# RoadScanner Alpha (`main.py`) – Setup, Env Vars, and Feature Validation
+# RoadScanner Alpha
 
-This repository runs a single-file Flask application from `main.py`.
+RoadScanner Alpha is a Flask web platform for road-scan risk analysis with:
+- user auth and account tiers,
+- admin operations and feature flags,
+- API-key based signed API access,
+- weather and geocode intelligence,
+- billing via Stripe,
+- optional Google OAuth login,
+- optional CAPTCHA protection,
+- optional SMTP/DKIM/PQ mail protections.
 
-## Quick start
+The app entrypoint is `main.py`.
+
+---
+
+## 1) What the program does
+
+At a high level, the application provides:
+
+1. **Interactive web app**
+   - Register/login, dashboard, scans, reports, settings, billing, corporate invite flow.
+
+2. **Admin controls**
+   - Admin pages for operational controls (feature flags, backups, local LLM controls, etc.).
+
+3. **Signed API access**
+   - HMAC-protected API requests using API keys + nonce + timestamp signature headers.
+
+4. **Security-by-default middleware**
+   - CSP/security headers, HTTPS enforcement option, CSRF/origin checks, ban/rate-limit gates.
+
+5. **Optional integrations**
+   - Stripe billing, Google OAuth, CAPTCHA, SMTP + DKIM/PQ mail, OpenAI/Grok/local-LLM hooks.
+
+---
+
+## 2) Hard-required environment variables
+
+The app **will not start** without these:
+
+- `INVITE_CODE_SECRET_KEY`
+  - Use a long, random value (recommended: at least 32 bytes entropy).
+- `admin_username`
+- `admin_pass` (must satisfy password-strength checks)
+
+Example:
+
+```bash
+export INVITE_CODE_SECRET_KEY='replace-with-very-long-random-secret'
+export admin_username='admin'
+export admin_pass='VeryStrongPassword123!'
+```
+
+---
+
+## 3) Quick local startup (minimal)
 
 ```bash
 pip install -r requirements.txt
-export INVITE_CODE_SECRET_KEY='replace-with-a-long-random-secret'
+
+export INVITE_CODE_SECRET_KEY='replace-with-very-long-random-secret'
 export admin_username='admin'
-export admin_pass='A-Very-Strong-Password-123!'
-# Optional: disable native OQS import for local/dev if liboqs isn't installed
+export admin_pass='VeryStrongPassword123!'
+
+# Keep optional native PQ disabled locally unless liboqs is ready
 export ENABLE_OQS_IMPORT=0
 export STRICT_PQ2_ONLY=0
-python main.py
-```
 
-Default bind in current code path is `http://127.0.0.1:3000`.
-
----
-
-## REQUIRED environment variables (hard requirements)
-
-These must be set or app startup will fail:
-
-1. `INVITE_CODE_SECRET_KEY`
-   - Purpose: Flask secret/session/CSRF root secret and invite-code cryptographic operations.
-   - Recommendation: 32+ random bytes (or long random string).
-
-2. `admin_username`
-   - Purpose: bootstrap/ensure admin account username.
-
-3. `admin_pass`
-   - Purpose: bootstrap/ensure admin account password.
-   - Note: strength checks are enforced; weak values are rejected.
-
----
-
-## Recommended local-development env profile
-
-```bash
-export ENABLE_OQS_IMPORT=0
-export STRICT_PQ2_ONLY=0
+# Optional providers off for initial bring-up
 export GOOGLE_OAUTH_ENABLED=false
 export CAPTCHA_ENABLED=false
 export STRIPE_ENABLED=false
 export EMAIL_ENABLED=false
+
+python main.py
 ```
 
-This keeps external-provider dependencies off so you can validate core routes quickly.
+Default bind in current app path is `http://127.0.0.1:3000`.
 
 ---
 
-## Feature flags and provider env vars
+## 4) Setup guide: Stripe payments (recommended flow)
 
-### Auth, registration, session/security
-- `REGISTRATION_ENABLED`
-- `SESSION_COOKIE_SAMESITE`
-- `SESSION_COOKIE_SECURE`
-- `ENFORCE_HTTPS`
-- `PROXYFIX_ENABLED`
-- `ALLOWED_ORIGINS`
+### Step A: Create Stripe products/prices
+In Stripe dashboard create prices for plans, then capture IDs.
+
+### Step B: Set env vars
+
+```bash
+export STRIPE_ENABLED=true
+export STRIPE_SECRET_KEY='sk_live_or_test_...'
+export STRIPE_WEBHOOK_SECRET='whsec_...'
+export STRIPE_PRICE_PRO_MONTHLY='price_...'
+export STRIPE_PRICE_CORP_MONTHLY='price_...'
+# optional credits packs as JSON mapping
+export STRIPE_CREDIT_PACKS_JSON='{"starter":"price_123","pro":"price_456"}'
+```
+
+### Step C: Configure webhook endpoint
+Point Stripe webhook to your app webhook route and subscribe to required billing events in dashboard.
+
+### Step D: Validate
+- Visit billing page.
+- Start checkout flow.
+- Confirm webhook delivery in Stripe dashboard.
+
+---
+
+## 5) Setup guide: Google OAuth
+
+### Step A: Create Google OAuth credentials
+- Create OAuth client in Google Cloud.
+- Add authorized redirect URI matching your deployment.
+
+### Step B: Set env vars
+
+```bash
+export GOOGLE_OAUTH_ENABLED=true
+export GOOGLE_CLIENT_ID='...apps.googleusercontent.com'
+export GOOGLE_CLIENT_SECRET='...'
+export GOOGLE_OAUTH_REDIRECT_URI='https://your-domain.com/auth/google/callback'
+```
+
+### Step C: Validate
+- Open `/auth/google/start`.
+- Complete Google consent.
+- Confirm callback and account/session creation.
+
+---
+
+## 6) Setup guide: CAPTCHA (Turnstile/hCaptcha)
+
+### Step A: Choose provider
+Supported via `CAPTCHA_PROVIDER`.
+
+### Step B: Set keys
+
+```bash
+export CAPTCHA_ENABLED=true
+export CAPTCHA_PROVIDER='turnstile'   # or hcaptcha
+export CAPTCHA_SITE_KEY='site_key_here'
+export CAPTCHA_SECRET_KEY='secret_key_here'
+```
+
+### Step C: Validate
+- Confirm CAPTCHA renders on protected forms.
+- Submit valid and invalid tokens to verify enforcement.
+
+---
+
+## 7) Setup guide: SMTP and DKIM (optional)
+
+```bash
+export EMAIL_ENABLED=true
+export EMAIL_FROM='noreply@your-domain.com'
+export EMAIL_SMTP_HOST='smtp.your-provider.com'
+export EMAIL_SMTP_PORT='587'
+export EMAIL_SMTP_USER='smtp-user'
+export EMAIL_SMTP_PASS='smtp-pass'
+
+export DKIM_ENABLED=true
+export DKIM_DOMAIN='your-domain.com'
+export DKIM_SELECTOR='selector1'
+export DKIM_PRIVATE_KEY_PATH='/secure/path/dkim_private.pem'
+```
+
+Optional alternative SMTP env aliases are also supported (`SMTP_HOST`, `SMTP_PORT`, etc.).
+
+---
+
+## 8) Security hardening controls (important)
+
+Recommended production settings:
+
+```bash
+export ENFORCE_HTTPS=true
+export SESSION_COOKIE_SECURE=true
+export SESSION_COOKIE_SAMESITE='Lax'
+# Strongly recommended in prod: set allowed hosts exactly
+export ALLOWED_HOSTS='your-domain.com,.your-domain.com'
+# Optional explicit browser mutation origin allowlist
+export ALLOWED_ORIGINS='https://your-domain.com,https://app.your-domain.com'
+```
+
+Additional controls:
 - `MAX_CONTENT_LENGTH_BYTES`
 - `CSP_STRICT_REPORT_ONLY`
-
-### CAPTCHA (Turnstile/hCaptcha)
-- `CAPTCHA_ENABLED`
-- `CAPTCHA_PROVIDER`
-- `CAPTCHA_SITE_KEY`
-- `CAPTCHA_SECRET_KEY`
-
-### Google OAuth
-- `GOOGLE_OAUTH_ENABLED`
-- `GOOGLE_CLIENT_ID`
-- `GOOGLE_CLIENT_SECRET`
-- `GOOGLE_OAUTH_REDIRECT_URI`
-
-### Billing/Stripe
-- `STRIPE_ENABLED`
-- `STRIPE_SECRET_KEY`
-- `STRIPE_WEBHOOK_SECRET`
-- `STRIPE_PRICE_PRO_MONTHLY`
-- `STRIPE_PRICE_CORP_MONTHLY`
-- `STRIPE_CREDIT_PACKS_JSON`
-
-### Email + DKIM + internal mail path
-- `EMAIL_ENABLED`
-- `EMAIL_FROM`
-- `EMAIL_SMTP_HOST`
-- `EMAIL_SMTP_PORT`
-- `EMAIL_SMTP_USER`
-- `EMAIL_SMTP_PASS`
-- `EMAIL_OUTBOUND_SMTP_PORT`
-- `EMAIL_OUTBOUND_TIMEOUT_SECONDS`
-- `EMAIL_INTERNAL_SERVER`
-- `EMAIL_MIN_INTERVAL_PER_RECIPIENT_SECONDS`
-- `SMTP_HOST`
-- `SMTP_PORT`
-- `SMTP_USER`
-- `SMTP_PASS`
-- `SMTP_FROM`
-- `DKIM_ENABLED`
-- `DKIM_DOMAIN`
-- `DKIM_SELECTOR`
-- `DKIM_SELECTORS`
-- `DKIM_PRIVATE_KEY`
-- `DKIM_PRIVATE_KEY_PATH`
-- `DKIM_ROTATE_DAYS`
-- `PQE_MAILSIG_ENABLED`
-
-### PQ/OQS and keystore crypto
-- `ENABLE_OQS_IMPORT`
-- `STRICT_PQ2_ONLY`
-- `QRS_KEYSTORE_DB_PATH`
-- `QRS_ENABLE_SEALED`
-- `ENCRYPTION_PASSPHRASE`
-- `PQ_OQS_ENABLED`
-- `PQ_OQS_ENCRYPT_ENABLED`
-- `PQ_OQS_SIG_ALG`
-- `PQ_OQS_KEM_ALG`
-- `PQ_OQS_ROTATE_DAYS`
-
-### LLM integrations
-- `LOCAL_LLM_ENABLED`
-- `LLAMA_LOCAL_ENABLED`
-- `LLAMA_MODEL_REPO`
-- `LLAMA_MODEL_FILE`
-- `LLAMA_MODELS_DIR`
-- `LLAMA_EXPECTED_SHA256`
-- `OPENAI_API_KEY`
-- `OPENAI_MODEL`
-- `OPENAI_REASONING_EFFORT`
-- `GROK_API_KEY`
-- `GROK_MODEL`
-
-### Quotas/rate limiting/plan controls
-- `API_DAILY_QUOTA`
-- `API_FREE_CREDITS`
-- `PRO_DAILY_QUOTA`
-- `CORP_DAILY_QUOTA`
-- `PRO_MONTHLY_CREDITS`
-- `CORP_MONTHLY_CREDITS`
-- `RATE_FREE_PER_MIN`
-- `RATE_FREE_PER_DAY`
-- `RATE_PRO_PER_MIN`
-- `RATE_PRO_PER_DAY`
-- `RATE_CORP_PER_MIN`
-- `RATE_CORP_PER_DAY`
-- `ANOM_FREE_PER_HOUR`
-- `ANOM_PRO_PER_HOUR`
-- `ANOM_CORP_PER_HOUR`
-- `ANOM_FREE_THROTTLE_SECONDS`
-- `ANOM_PRO_THROTTLE_SECONDS`
-- `ANOM_CORP_THROTTLE_SECONDS`
-- `ALERT_MIN_GAP_SECONDS`
-- `ALERTS_DISPATCH_MAX`
-
-### Weather/geocode/cache/runtime behavior
-- `DISABLE_NOMINATIM`
-- `NOMINATIM_URL`
-- `NOMINATIM_USER_AGENT`
-- `REVGEOCODE_CACHE_TTL_S`
-- `WX_CACHE_TTL`
-- `API_CACHE_TTL_SCAN_SECONDS`
-- `DB_TIMEOUT_SECONDS`
-
-### Admin/background/internal controls
-- `ADMIN_CRON_TOKEN`
-- `BLOG_BACKUP_PATH`
-- `QRS_BG_LOCK_PATH`
-- `QRS_BG_STARTED`
-- `QRS_BOOTSTRAP_SHOW`
-- `QRS_COMPRESS_MIN`
-- `QRS_ENV_CAP_BYTES`
+- `PROXYFIX_ENABLED`
 - `QRS_ROTATE_SESSION_KEY`
-- `QRS_SESSION_KEY_ROTATION_PERIOD_SECONDS`
-- `QRS_SESSION_KEY_ROTATION_LOOKBACK`
-- `CTX_FREE_MAX_TOKENS`
-- `CTX_PRO_MAX_TOKENS`
-- `CTX_CORP_MAX_TOKENS`
 
 ---
 
-## Complete env var index (alphabetical)
+## 9) Complete environment variable index (alphabetical)
 
-`ADMIN_CRON_TOKEN`, `ALERTS_DISPATCH_MAX`, `ALERT_MIN_GAP_SECONDS`, `ALLOWED_ORIGINS`, `ANOM_CORP_PER_HOUR`, `ANOM_CORP_THROTTLE_SECONDS`, `ANOM_FREE_PER_HOUR`, `ANOM_FREE_THROTTLE_SECONDS`, `ANOM_PRO_PER_HOUR`, `ANOM_PRO_THROTTLE_SECONDS`, `API_CACHE_TTL_SCAN_SECONDS`, `API_DAILY_QUOTA`, `API_FREE_CREDITS`, `API_NONCE_TTL_SECONDS`, `API_SIG_TTL_SECONDS`, `BLOG_BACKUP_PATH`, `CAPTCHA_ENABLED`, `CAPTCHA_PROVIDER`, `CAPTCHA_SECRET_KEY`, `CAPTCHA_SITE_KEY`, `CORP_DAILY_QUOTA`, `CORP_MONTHLY_CREDITS`, `CSP_STRICT_REPORT_ONLY`, `CTX_CORP_MAX_TOKENS`, `CTX_FREE_MAX_TOKENS`, `CTX_PRO_MAX_TOKENS`, `DB_TIMEOUT_SECONDS`, `DISABLE_NOMINATIM`, `DKIM_DOMAIN`, `DKIM_ENABLED`, `DKIM_PRIVATE_KEY`, `DKIM_PRIVATE_KEY_PATH`, `DKIM_ROTATE_DAYS`, `DKIM_SELECTOR`, `DKIM_SELECTORS`, `EMAIL_ENABLED`, `EMAIL_FROM`, `EMAIL_INTERNAL_SERVER`, `EMAIL_MIN_INTERVAL_PER_RECIPIENT_SECONDS`, `EMAIL_OUTBOUND_SMTP_PORT`, `EMAIL_OUTBOUND_TIMEOUT_SECONDS`, `EMAIL_SMTP_HOST`, `EMAIL_SMTP_PASS`, `EMAIL_SMTP_PORT`, `EMAIL_SMTP_USER`, `ENABLE_OQS_IMPORT`, `ENCRYPTION_PASSPHRASE`, `ENFORCE_HTTPS`, `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, `GOOGLE_OAUTH_ENABLED`, `GOOGLE_OAUTH_REDIRECT_URI`, `GROK_API_KEY`, `GROK_MODEL`, `INVITE_CODE_SECRET_KEY`, `LLAMA_EXPECTED_SHA256`, `LLAMA_LOCAL_ENABLED`, `LLAMA_MODELS_DIR`, `LLAMA_MODEL_FILE`, `LLAMA_MODEL_REPO`, `LOCAL_LLM_ENABLED`, `MAX_CONTENT_LENGTH_BYTES`, `NOMINATIM_URL`, `NOMINATIM_USER_AGENT`, `OPENAI_API_KEY`, `OPENAI_MODEL`, `OPENAI_REASONING_EFFORT`, `PQE_MAILSIG_ENABLED`, `PQ_OQS_ENABLED`, `PQ_OQS_ENCRYPT_ENABLED`, `PQ_OQS_KEM_ALG`, `PQ_OQS_ROTATE_DAYS`, `PQ_OQS_SIG_ALG`, `PROXYFIX_ENABLED`, `PRO_DAILY_QUOTA`, `PRO_MONTHLY_CREDITS`, `QRS_BG_LOCK_PATH`, `QRS_BG_STARTED`, `QRS_BOOTSTRAP_SHOW`, `QRS_COMPRESS_MIN`, `QRS_ENABLE_SEALED`, `QRS_ENV_CAP_BYTES`, `QRS_KEYSTORE_DB_PATH`, `QRS_ROTATE_SESSION_KEY`, `QRS_SESSION_KEY_ROTATION_LOOKBACK`, `QRS_SESSION_KEY_ROTATION_PERIOD_SECONDS`, `RATE_CORP_PER_DAY`, `RATE_CORP_PER_MIN`, `RATE_FREE_PER_DAY`, `RATE_FREE_PER_MIN`, `RATE_PRO_PER_DAY`, `RATE_PRO_PER_MIN`, `REGISTRATION_ENABLED`, `REVGEOCODE_CACHE_TTL_S`, `SESSION_COOKIE_SAMESITE`, `SESSION_COOKIE_SECURE`, `SMTP_FROM`, `SMTP_HOST`, `SMTP_PASS`, `SMTP_PORT`, `SMTP_USER`, `STRICT_PQ2_ONLY`, `STRIPE_CREDIT_PACKS_JSON`, `STRIPE_ENABLED`, `STRIPE_PRICE_CORP_MONTHLY`, `STRIPE_PRICE_PRO_MONTHLY`, `STRIPE_SECRET_KEY`, `STRIPE_WEBHOOK_SECRET`, `WX_CACHE_TTL`, `admin_pass`, `admin_username`.
+`ADMIN_CRON_TOKEN`, `ALERTS_DISPATCH_MAX`, `ALERT_MIN_GAP_SECONDS`, `ALLOWED_HOSTS`, `ALLOWED_ORIGINS`, `ANOM_CORP_PER_HOUR`, `ANOM_CORP_THROTTLE_SECONDS`, `ANOM_FREE_PER_HOUR`, `ANOM_FREE_THROTTLE_SECONDS`, `ANOM_PRO_PER_HOUR`, `ANOM_PRO_THROTTLE_SECONDS`, `API_CACHE_TTL_SCAN_SECONDS`, `API_DAILY_QUOTA`, `API_FREE_CREDITS`, `API_NONCE_TTL_SECONDS`, `API_SIG_TTL_SECONDS`, `BLOG_BACKUP_PATH`, `CAPTCHA_ENABLED`, `CAPTCHA_PROVIDER`, `CAPTCHA_SECRET_KEY`, `CAPTCHA_SITE_KEY`, `CORP_DAILY_QUOTA`, `CORP_MONTHLY_CREDITS`, `CSP_STRICT_REPORT_ONLY`, `CTX_CORP_MAX_TOKENS`, `CTX_FREE_MAX_TOKENS`, `CTX_PRO_MAX_TOKENS`, `DB_TIMEOUT_SECONDS`, `DISABLE_NOMINATIM`, `DKIM_DOMAIN`, `DKIM_ENABLED`, `DKIM_PRIVATE_KEY`, `DKIM_PRIVATE_KEY_PATH`, `DKIM_ROTATE_DAYS`, `DKIM_SELECTOR`, `DKIM_SELECTORS`, `EMAIL_ENABLED`, `EMAIL_FROM`, `EMAIL_INTERNAL_SERVER`, `EMAIL_MIN_INTERVAL_PER_RECIPIENT_SECONDS`, `EMAIL_OUTBOUND_SMTP_PORT`, `EMAIL_OUTBOUND_TIMEOUT_SECONDS`, `EMAIL_SMTP_HOST`, `EMAIL_SMTP_PASS`, `EMAIL_SMTP_PORT`, `EMAIL_SMTP_USER`, `ENABLE_OQS_IMPORT`, `ENCRYPTION_PASSPHRASE`, `ENFORCE_HTTPS`, `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, `GOOGLE_OAUTH_ENABLED`, `GOOGLE_OAUTH_REDIRECT_URI`, `GROK_API_KEY`, `GROK_MODEL`, `INVITE_CODE_SECRET_KEY`, `LLAMA_EXPECTED_SHA256`, `LLAMA_LOCAL_ENABLED`, `LLAMA_MODELS_DIR`, `LLAMA_MODEL_FILE`, `LLAMA_MODEL_REPO`, `LOCAL_LLM_ENABLED`, `MAX_CONTENT_LENGTH_BYTES`, `NOMINATIM_URL`, `NOMINATIM_USER_AGENT`, `OPENAI_API_KEY`, `OPENAI_MODEL`, `OPENAI_REASONING_EFFORT`, `PQE_MAILSIG_ENABLED`, `PQ_OQS_ENABLED`, `PQ_OQS_ENCRYPT_ENABLED`, `PQ_OQS_KEM_ALG`, `PQ_OQS_ROTATE_DAYS`, `PQ_OQS_SIG_ALG`, `PROXYFIX_ENABLED`, `PRO_DAILY_QUOTA`, `PRO_MONTHLY_CREDITS`, `QRS_BG_LOCK_PATH`, `QRS_BG_STARTED`, `QRS_BOOTSTRAP_SHOW`, `QRS_COMPRESS_MIN`, `QRS_ENABLE_SEALED`, `QRS_ENV_CAP_BYTES`, `QRS_KEYSTORE_DB_PATH`, `QRS_ROTATE_SESSION_KEY`, `QRS_SESSION_KEY_ROTATION_LOOKBACK`, `QRS_SESSION_KEY_ROTATION_PERIOD_SECONDS`, `RATE_CORP_PER_DAY`, `RATE_CORP_PER_MIN`, `RATE_FREE_PER_DAY`, `RATE_FREE_PER_MIN`, `RATE_PRO_PER_DAY`, `RATE_PRO_PER_MIN`, `REGISTRATION_ENABLED`, `REVGEOCODE_CACHE_TTL_S`, `SESSION_COOKIE_SAMESITE`, `SESSION_COOKIE_SECURE`, `SMTP_FROM`, `SMTP_HOST`, `SMTP_PASS`, `SMTP_PORT`, `SMTP_USER`, `STRICT_PQ2_ONLY`, `STRIPE_CREDIT_PACKS_JSON`, `STRIPE_ENABLED`, `STRIPE_PRICE_CORP_MONTHLY`, `STRIPE_PRICE_PRO_MONTHLY`, `STRIPE_SECRET_KEY`, `STRIPE_WEBHOOK_SECRET`, `WX_CACHE_TTL`, `admin_pass`, `admin_username`.
 
 ---
 
-## Smoke test commands used
+## 10) Core smoke test commands
 
-### Syntax
 ```bash
 python -m py_compile main.py
-```
 
-### Startup
-```bash
-ENABLE_OQS_IMPORT=0 STRICT_PQ2_ONLY=0 INVITE_CODE_SECRET_KEY=dev-secret admin_username=admin admin_pass='Admin123!Strong' python main.py
-```
+ENABLE_OQS_IMPORT=0 STRICT_PQ2_ONLY=0 \
+INVITE_CODE_SECRET_KEY='replace-with-very-long-random-secret' \
+admin_username='admin' admin_pass='VeryStrongPassword123!' \
+python main.py
 
-### Route checks (unauthenticated baseline)
-```bash
-curl -m 6 -s -o /tmp/out -w '%{http_code}' http://127.0.0.1:3000/login
-curl -m 6 -s -o /tmp/out -w '%{http_code}' http://127.0.0.1:3000/register
-curl -m 6 -s -o /tmp/out -w '%{http_code}' http://127.0.0.1:3000/dashboard
-curl -m 6 -s -o /tmp/out -w '%{http_code}' -X POST http://127.0.0.1:3000/start_scan
+curl -m 6 -s -o /tmp/out -w '%{http_code}\n' http://127.0.0.1:3000/login
+curl -m 6 -s -o /tmp/out -w '%{http_code}\n' http://127.0.0.1:3000/register
+curl -m 6 -s -o /tmp/out -w '%{http_code}\n' http://127.0.0.1:3000/dashboard
+curl -m 6 -s -o /tmp/out -w '%{http_code}\n' -X POST http://127.0.0.1:3000/start_scan
 ```
-
-### Screenshot
-Playwright capture is validated in this environment using Firefox engine.
