@@ -256,7 +256,13 @@ def _enforce_origin_checks():
     # Exempt programmatic/API endpoints and webhooks where Origin is absent
     if path.startswith("/api/v1/") or path.startswith("/stripe/webhook") or path.startswith("/csp-report"):
         return None
-    if path in ("/login", "/register", "/forgot_password", "/reset_password"):
+    if path in (
+        "/login",
+        "/register",
+        "/forgot_password",
+        "/reset_password",
+        "/api_keys",
+    ):
         # Flask-WTF CSRF already protects these forms; some mobile browsers omit Origin.
         return None
     if request.headers.get("X-API-Key-Id"):
@@ -1298,6 +1304,9 @@ def require_api_auth(fn):
 
 OPEN_METEO_BASE = "https://api.open-meteo.com/v1/forecast"
 
+_WX_CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
+_WX_CACHE_LOCK = threading.Lock()
+
 def _paid_only_or_admin() -> Optional[Response]:
     if session.get("is_admin"):
         return None
@@ -1311,13 +1320,15 @@ def _paid_only_or_admin() -> Optional[Response]:
     return None
 
 def _fetch_open_meteo(lat: float, lon: float) -> dict[str, Any]:
-    """
-    Fetch comprehensive weather and hazard-adjacent signals. Cached (TTL) to reduce load.
-    """
-    cache_key = _hash_cache_key("wx", f"{lat:.4f},{lon:.4f}")
-    cached = _api_cache_get(cache_key)
-    if cached:
-        return cached
+    """Fetch comprehensive weather and hazard-adjacent signals with local TTL cache."""
+    cache_key = _hash_cache_key(["wx", f"{lat:.4f},{lon:.4f}"])
+    ttl = max(30, int(os.getenv("WX_CACHE_TTL", "600")))
+    now = time.time()
+
+    with _WX_CACHE_LOCK:
+        hit = _WX_CACHE.get(cache_key)
+        if hit and hit[0] > now:
+            return hit[1]
 
     params = {
         "latitude": lat,
@@ -1331,7 +1342,10 @@ def _fetch_open_meteo(lat: float, lon: float) -> dict[str, Any]:
     r = httpx.get(OPEN_METEO_BASE, params=params, timeout=10.0)
     r.raise_for_status()
     data = r.json()
-    _api_cache_set(cache_key, data, ttl_seconds=int(os.getenv("WX_CACHE_TTL", "600")))
+
+    with _WX_CACHE_LOCK:
+        _WX_CACHE[cache_key] = (now + ttl, data)
+
     return data
 
 def _weather_risk_prompt(lat: float, lon: float, wx: dict[str, Any], extra_context: str="") -> str:
@@ -1369,6 +1383,81 @@ Extra context:
 
 Max tokens target for this user tier: {limits.get("max_tokens", 2048)}
 """.strip()
+
+def _simulate_weather_summary(lat: float, lon: float, wx: dict[str, Any]) -> str:
+    """Deterministic advanced weather summary when external LLM is unavailable."""
+    cur = (wx or {}).get("current") or {}
+    hourly = (wx or {}).get("hourly") or {}
+    daily = (wx or {}).get("daily") or {}
+
+    def _f(v, d=0.0):
+        try:
+            return float(v)
+        except Exception:
+            return float(d)
+
+    temp = _f(cur.get("temperature_2m"), 0.0)
+    wind = _f(cur.get("wind_speed_10m"), 0.0)
+    gust = _f(cur.get("wind_gusts_10m"), wind)
+    precip = _f(cur.get("precipitation"), 0.0)
+    cloud = _f(cur.get("cloud_cover"), 0.0)
+
+    probs = hourly.get("precipitation_probability") or []
+    vis = hourly.get("visibility") or []
+    winds = hourly.get("wind_speed_10m") or []
+    daily_precip = daily.get("precipitation_sum") or []
+
+    max_prob = max([_f(x) for x in probs], default=0.0)
+    min_vis_km = min([_f(x) for x in vis], default=10000.0) / 1000.0
+    max_wind = max([_f(x) for x in winds], default=wind)
+    week_precip = sum([_f(x) for x in daily_precip])
+
+    risk = 8.0
+    risk += min(30.0, max_prob * 0.25)
+    risk += min(20.0, max(0.0, max_wind - 25.0) * 0.9)
+    risk += min(16.0, max(0.0, 5.0 - min_vis_km) * 3.0)
+    risk += min(12.0, max(0.0, week_precip - 8.0) * 0.5)
+    risk += min(8.0, precip * 3.0)
+    risk = max(0.0, min(100.0, round(risk, 1)))
+
+    if risk < 30:
+        band = "LOW"
+    elif risk < 55:
+        band = "MED"
+    elif risk < 75:
+        band = "HIGH"
+    else:
+        band = "SEVERE"
+
+    advisory = []
+    if max_prob >= 60:
+        advisory.append("High precipitation probability windows expected; increase following distance and reduce speed near turns.")
+    if max_wind >= 40 or gust >= 50:
+        advisory.append("Wind/gust profile may affect vehicle stability, especially high-profile vehicles and bridges.")
+    if min_vis_km < 2.0:
+        advisory.append("Visibility may drop below 2 km; use low-beam lights and avoid abrupt lane changes.")
+    if not advisory:
+        advisory.append("No dominant severe trigger detected; maintain defensive driving posture and monitor rapid condition changes.")
+
+    return (
+        f"## QRS Advanced Weather Simulation Summary\n"
+        f"Location: ({lat:.4f}, {lon:.4f})\n\n"
+        f"### 0-6h Outlook\n"
+        f"- Temperature near {temp:.1f}°C with cloud cover around {cloud:.0f}%.\n"
+        f"- Precipitation probability peak: {max_prob:.0f}% and current precip rate: {precip:.1f} mm/h.\n"
+        f"- Wind profile: sustained {wind:.1f} km/h, gusts up to {gust:.1f} km/h.\n\n"
+        f"### 24h Operational Risk\n"
+        f"- Simulated road-risk score: **{risk:.1f}/100 ({band})**.\n"
+        f"- Minimum projected visibility: {min_vis_km:.1f} km.\n"
+        f"- Peak hourly wind: {max_wind:.1f} km/h.\n\n"
+        f"### 7-Day Context\n"
+        f"- Total forecast precipitation (7-day): {week_precip:.1f} mm.\n"
+        f"- Risk band can shift quickly with frontal wind/precip spikes.\n\n"
+        f"### Driver/Dispatch Mitigations\n"
+        + "\n".join([f"- {x}" for x in advisory])
+        + "\n- Re-check live conditions before departure and midway through longer trips."
+    )
+
 
 def _generate_weather_report(lat: float, lon: float, wx: dict[str, Any]) -> dict[str, Any]:
     """
@@ -1408,6 +1497,10 @@ def _generate_weather_report(lat: float, lon: float, wx: dict[str, Any]) -> dict
         logger.exception("Weather report generation failed")
         text_out = ""
 
+    if not (text_out or "").strip():
+        text_out = _simulate_weather_summary(lat, lon, wx)
+        return {"ok": True, "model": "simulation", "report": text_out}
+
     return {"ok": True, "model": preferred, "report": text_out}
 
 @app.get("/weather")
@@ -1439,7 +1532,13 @@ def weather_page():
         lon_f = parse_safe_float(lon) if lon else 0.0
     except ValueError:
         lon_f = 0.0
-    wx = _fetch_open_meteo(lat_f, lon_f) if (lat_f and lon_f) else {}
+    wx = {}
+    if lat_f and lon_f:
+        try:
+            wx = _fetch_open_meteo(lat_f, lon_f)
+        except Exception:
+            logger.exception("Weather fetch failed")
+            wx = {}
     rep = _generate_weather_report(lat_f, lon_f, wx) if wx else {"ok": False, "error": "missing_location"}
 
     return render_template_string("""
@@ -1503,11 +1602,18 @@ def api_weather():
     if not (session.get("is_admin") or _is_paid_plan(plan)):
         return api_error("paid_required", "Paid plan required.", status=402)
 
-    lat = parse_safe_float(request.args.get("lat",""))
-    lon = parse_safe_float(request.args.get("lon",""))
+    try:
+        lat = parse_safe_float(request.args.get("lat", ""))
+        lon = parse_safe_float(request.args.get("lon", ""))
+    except ValueError:
+        lat = lon = None
     if lat is None or lon is None:
         return api_error("invalid_location", "lat/lon required.", status=400)
-    wx = _fetch_open_meteo(float(lat), float(lon))
+    try:
+        wx = _fetch_open_meteo(float(lat), float(lon))
+    except Exception:
+        logger.exception("api_weather fetch failed")
+        return api_error("weather_unavailable", "Weather provider unavailable.", status=502)
     return api_ok(weather=wx)
 
 @app.get("/api/v1/weather/report")
@@ -1517,11 +1623,18 @@ def api_weather_report():
     if not (session.get("is_admin") or _is_paid_plan(plan)):
         return api_error("paid_required", "Paid plan required.", status=402)
 
-    lat = parse_safe_float(request.args.get("lat",""))
-    lon = parse_safe_float(request.args.get("lon",""))
+    try:
+        lat = parse_safe_float(request.args.get("lat", ""))
+        lon = parse_safe_float(request.args.get("lon", ""))
+    except ValueError:
+        lat = lon = None
     if lat is None or lon is None:
         return api_error("invalid_location", "lat/lon required.", status=400)
-    wx = _fetch_open_meteo(float(lat), float(lon))
+    try:
+        wx = _fetch_open_meteo(float(lat), float(lon))
+    except Exception:
+        logger.exception("api_weather_report fetch failed")
+        return api_error("weather_unavailable", "Weather provider unavailable.", status=502)
     rep = _generate_weather_report(float(lat), float(lon), wx)
     if not rep.get("ok"):
         return api_error("report_failed", "Report generation failed.", status=500)
@@ -11720,7 +11833,7 @@ def dashboard():
       </div>
       <div class="cardx-b">
         <div class="grid-actions">
-          <a class="btnx" href="{{ url_for('home') }}">Start a New Scan</a>
+          <a class="btnx" href="#scan-panel">Start a New Scan</a>
           <a class="btnx alt" href="{{ url_for('blog_index') }}">Blog</a>
           <a class="btnx alt" href="{{ url_for('settings') }}">Settings</a>
           <a class="btnx alt" href="{{ url_for('weather_page') }}">Weather Intelligence</a>
@@ -11728,6 +11841,35 @@ def dashboard():
           {% if session.get('is_admin') %}
             <a class="btnx" href="{{ url_for('admin_console') }}">Admin Console</a>
           {% endif %}
+        </div>
+
+        <div class="section-gap" id="scan-panel">
+          <div class="d-flex align-items-center justify-content-between">
+            <div class="title" style="font-size:1rem;">Advanced Scan</div>
+            <span class="muted">Runs through the dashboard scanner pipeline</span>
+          </div>
+          <form id="scanForm" class="mt-3">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token }}" />
+            <div class="row g-2">
+              <div class="col-md-3"><input id="scanLat" class="form-control" name="latitude" placeholder="Latitude (e.g. 37.7749)" required></div>
+              <div class="col-md-3"><input id="scanLon" class="form-control" name="longitude" placeholder="Longitude (e.g. -122.4194)" required></div>
+              <div class="col-md-2"><input class="form-control" name="vehicle_type" placeholder="Vehicle" value="sedan" required></div>
+              <div class="col-md-3"><input class="form-control" name="destination" placeholder="Destination" required></div>
+              <div class="col-md-1">
+                <select class="form-control" name="model_selection" title="Model">
+                  <option value="openai">OpenAI</option>
+                  <option value="grok" {% if preferred_model == 'grok' %}selected{% endif %}>Grok</option>
+                  <option value="llama_local" {% if preferred_model == 'llama_local' %}selected{% endif %}>Llama</option>
+                </select>
+              </div>
+            </div>
+            <div class="mt-2 d-flex gap-2 align-items-center">
+              <button type="button" class="btnx btnx-ghost" id="gpsBtn">Use GPS</button>
+              <button type="submit" class="btnx">Run Scan</button>
+              <span id="scanStatus" class="muted"></span>
+            </div>
+          </form>
+          <div id="scanResult" class="muted mt-2" style="white-space:pre-wrap;"></div>
         </div>
 
         <div class="section-gap">
@@ -11772,6 +11914,67 @@ def dashboard():
       QRS • Secure scanning and risk intelligence
     </div>
   </div>
+
+  <script>
+    async function qrsScanSubmit(ev){
+      ev.preventDefault();
+      const form = document.getElementById('scanForm');
+      const statusEl = document.getElementById('scanStatus');
+      const outEl = document.getElementById('scanResult');
+      const fd = new FormData(form);
+      const payload = Object.fromEntries(fd.entries());
+      statusEl.textContent = 'Scanning…';
+      outEl.textContent = '';
+      try {
+        const r = await fetch('/start_scan', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'X-CSRFToken': payload.csrf_token || ''
+          },
+          credentials: 'same-origin',
+          body: JSON.stringify(payload)
+        });
+        const j = await r.json().catch(()=>({error:'invalid_response'}));
+        if (!r.ok) {
+          statusEl.textContent = 'Scan failed';
+          outEl.textContent = JSON.stringify(j, null, 2);
+          return;
+        }
+        statusEl.textContent = 'Scan complete';
+        outEl.textContent = `Risk: ${j.harm_level || 'n/a'}
+Model: ${j.model_used || 'n/a'}
+${j.result || ''}`;
+      } catch (e) {
+        statusEl.textContent = 'Scan failed';
+        outEl.textContent = String(e);
+      }
+    }
+    async function fillGps(){
+      const statusEl = document.getElementById('scanStatus');
+      const latEl = document.getElementById('scanLat');
+      const lonEl = document.getElementById('scanLon');
+      if (!navigator.geolocation || !latEl || !lonEl){
+        statusEl.textContent = 'GPS unavailable in this browser';
+        return;
+      }
+      statusEl.textContent = 'Locating…';
+      navigator.geolocation.getCurrentPosition(function(pos){
+        latEl.value = Number(pos.coords.latitude || 0).toFixed(6);
+        lonEl.value = Number(pos.coords.longitude || 0).toFixed(6);
+        statusEl.textContent = 'GPS location loaded';
+      }, function(err){
+        statusEl.textContent = 'GPS failed: ' + (err && err.message ? err.message : 'unknown');
+      }, {enableHighAccuracy:true, timeout:12000, maximumAge:30000});
+    }
+
+    document.addEventListener('DOMContentLoaded', function(){
+      const f = document.getElementById('scanForm');
+      if (f) f.addEventListener('submit', qrsScanSubmit);
+      const gpsBtn = document.getElementById('gpsBtn');
+      if (gpsBtn) gpsBtn.addEventListener('click', fillGps);
+    });
+  </script>
 
   <script>
     // Bootstrap collapse relies on bundled JS; in single-file deployments it may not exist.
@@ -12385,7 +12588,7 @@ def api_keys_page():
                 db.commit()
                 one_time_secret = secret
                 message = "API key created. Copy the secret now — it will not be shown again."
-                audit_log_event("api_key_create", actor=username, target=f"user_id={user_id}", detail=f"key_id={key_id_new}")
+                audit_log_event("api_key_create", actor=username, target=f"user_id={user_id}", meta={"key_id": key_id_new})
             elif action == "revoke" and key_id:
                 db.execute(
                     "UPDATE api_keys SET revoked = 1 WHERE user_id = ? AND key_id = ?",
@@ -12393,7 +12596,7 @@ def api_keys_page():
                 )
                 db.commit()
                 message = "API key revoked."
-                audit_log_event("api_key_revoke", actor=username, target=f"user_id={user_id}", detail=f"key_id={key_id}")
+                audit_log_event("api_key_revoke", actor=username, target=f"user_id={user_id}", meta={"key_id": key_id})
             else:
                 message = "Unknown action."
 
@@ -13190,13 +13393,13 @@ async def start_scan_route():
             return jsonify({"error":
                             "Rate limit exceeded. Try again later."}), 429
 
-    data = request.get_json()
+    data = request.get_json(silent=True) or request.form.to_dict(flat=True) or {}
 
-    lat = sanitize_input(data.get('latitude'))
-    lon = sanitize_input(data.get('longitude'))
+    lat = sanitize_input(data.get('latitude') or data.get('lat'))
+    lon = sanitize_input(data.get('longitude') or data.get('lon'))
     vehicle_type = sanitize_input(data.get('vehicle_type'))
     destination = sanitize_input(data.get('destination'))
-    model_selection = sanitize_input(data.get('model_selection'))
+    model_selection = sanitize_input(data.get('model_selection') or get_user_preferred_model(user_id) or 'openai')
 
     if not lat or not lon or not vehicle_type or not destination or not model_selection:
         return jsonify({"error": "Missing required data"}), 400
