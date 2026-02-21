@@ -1431,8 +1431,14 @@ def weather_page():
         except Exception:
             pass
 
-    lat_f = parse_safe_float(lat) or 0.0
-    lon_f = parse_safe_float(lon) or 0.0
+    try:
+        lat_f = parse_safe_float(lat) if lat else 0.0
+    except ValueError:
+        lat_f = 0.0
+    try:
+        lon_f = parse_safe_float(lon) if lon else 0.0
+    except ValueError:
+        lon_f = 0.0
     wx = _fetch_open_meteo(lat_f, lon_f) if (lat_f and lon_f) else {}
     rep = _generate_weather_report(lat_f, lon_f, wx) if wx else {"ok": False, "error": "missing_location"}
 
@@ -5031,7 +5037,7 @@ def blog_delete(post_id: int) -> bool:
         logger.error(f"blog_delete failed: {e}", exc_info=True)
         return False
 
-@app.get("/blog", endpoint="blog")
+@app.get("/blog")
 def blog_index():
     posts = blog_list_published(limit=50, offset=0)
     seed = colorsync.sample()
@@ -11715,7 +11721,7 @@ def dashboard():
       <div class="cardx-b">
         <div class="grid-actions">
           <a class="btnx" href="{{ url_for('home') }}">Start a New Scan</a>
-          <a class="btnx alt" href="{{ url_for('blog') }}">Blog</a>
+          <a class="btnx alt" href="{{ url_for('blog_index') }}">Blog</a>
           <a class="btnx alt" href="{{ url_for('settings') }}">Settings</a>
           <a class="btnx alt" href="{{ url_for('weather_page') }}">Weather Intelligence</a>
           <a class="btnx alt" href="{{ url_for('api_keys_page') }}">API Keys</a>
@@ -11803,7 +11809,7 @@ def dashboard():
     <a class="active" href="{{ url_for('dashboard') }}">Dashboard</a>
     <a href="{{ url_for('home') }}">Scan</a>
     <a href="{{ url_for('weather_page') }}">Weather</a>
-    <a href="{{ url_for('blog') }}">Blog</a>
+    <a href="{{ url_for('blog_index') }}">Blog</a>
     <a href="{{ url_for('settings') }}">Settings</a>
   </nav>
 
@@ -13161,16 +13167,15 @@ async def api_scan():
 @app.route('/start_scan', methods=['POST'])
 async def start_scan_route():
 
-    # Enforce captcha for scanner use (unless admin)
-    if not session.get("is_admin"):
-        if not _captcha_ok():
-            token = _captcha_token_from_request()
-            if not token:
-                return api_error("captcha_required", "Captcha required.", 429)
-            ok, err = verify_captcha(token, request.remote_addr or "", action="scan")
-            if not ok:
-                return api_error("captcha_invalid", err or "Captcha failed.", 429)
-            _set_captcha_ok(30)
+    # Enforce captcha for scanner use (unless admin).
+    if not session.get("is_admin") and _captcha_enabled() and not _captcha_ok():
+        token = _captcha_token_from_request()
+        if not token:
+            return api_error("captcha_required", "Captcha required.", 429)
+        ok, err = await verify_captcha(token, request.remote_addr or "", action="scan")
+        if not ok:
+            return api_error("captcha_invalid", err or "Captcha failed.", 429)
+        _set_captcha_ok(30)
     if 'username' not in session:
         return redirect(url_for('login'))
 
@@ -13184,13 +13189,6 @@ async def start_scan_route():
         if not check_rate_limit(user_id):
             return jsonify({"error":
                             "Rate limit exceeded. Try again later."}), 429
-
-    if _captcha_enabled() and not _captcha_ok() and not session.get('is_admin', False):
-        token = _captcha_token_from_request()
-        ok, err = verify_captcha_sync(token, remoteip=request.remote_addr or "", action="scan")
-        if not ok:
-            return jsonify({"error": err or "Captcha verification failed."}), 400
-        _set_captcha_ok()
 
     data = request.get_json()
 
