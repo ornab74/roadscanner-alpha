@@ -332,7 +332,7 @@ def _add_security_headers(resp):
     resp.headers.setdefault("X-Content-Type-Options", "nosniff")
     resp.headers.setdefault("X-Frame-Options", "DENY")
     resp.headers.setdefault("Referrer-Policy", "no-referrer")
-    resp.headers.setdefault("Permissions-Policy", "geolocation=(), microphone=(), camera=()")
+    resp.headers.setdefault("Permissions-Policy", "geolocation=(self), microphone=(), camera=()")
     resp.headers.setdefault("Cross-Origin-Opener-Policy", "same-origin")
     resp.headers.setdefault("Cross-Origin-Resource-Policy", "same-site")
 
@@ -1583,13 +1583,37 @@ def weather_page():
 
     <div class="card p-3">
       {% if rep.ok %}
-        <div style="opacity:.8;">Model: {{ rep.model }}</div>
-        <pre class="mt-2">{{ rep.report }}</pre>
+        <div class="opacity-75">Model: {{ rep.model }}</div>
+        <div class="mt-2 d-flex gap-2">
+          <button id="readWeatherBtn" type="button" class="btn btn-sm btn-light">🔊 Read Report</button>
+          <button id="stopWeatherBtn" type="button" class="btn btn-sm btn-outline-light">⏹ Stop</button>
+        </div>
+        <pre class="mt-2" id="weatherReportText">{{ rep.report }}</pre>
       {% else %}
         <div class="text-warning">Unable to generate report. Provide a valid location.</div>
       {% endif %}
     </div>
   </div>
+  <script>
+    (function(){
+      const readBtn = document.getElementById('readWeatherBtn');
+      const stopBtn = document.getElementById('stopWeatherBtn');
+      const reportEl = document.getElementById('weatherReportText');
+      if (!readBtn || !stopBtn || !reportEl) return;
+      const synth = window.speechSynthesis;
+      readBtn.addEventListener('click', function(){
+        if (!synth) return;
+        synth.cancel();
+        const u = new SpeechSynthesisUtterance((reportEl.textContent || '').trim());
+        u.rate = 1.0;
+        u.pitch = 1.0;
+        synth.speak(u);
+      });
+      stopBtn.addEventListener('click', function(){
+        if (synth) synth.cancel();
+      });
+    })();
+  </script>
 </body>
 </html>
     """, lat=lat, lon=lon, rep=rep)
@@ -4183,6 +4207,17 @@ def create_tables():
         """)
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_audit_ts ON audit_log(ts)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_audit_actor ON audit_log(actor)")
+
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS csp_reports (
+                id INTEGER PRIMARY KEY,
+                received_at TEXT NOT NULL,
+                ip TEXT,
+                user_agent TEXT,
+                report_json TEXT NOT NULL
+            )
+        """)
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_csp_reports_received_at ON csp_reports(received_at)")
 
         cursor.execute("""
     CREATE TABLE IF NOT EXISTS user_query_events (
@@ -11865,7 +11900,7 @@ def dashboard():
             </div>
             <div class="mt-2 d-flex gap-2 align-items-center">
               <button type="button" class="btnx btnx-ghost" id="gpsBtn">Use GPS</button>
-              <button type="submit" class="btnx">Run Scan</button>
+              <button type="submit" class="btnx" id="scanSubmitBtn">Run Scan</button>
               <span id="scanStatus" class="muted"></span>
             </div>
           </form>
@@ -11921,10 +11956,12 @@ def dashboard():
       const form = document.getElementById('scanForm');
       const statusEl = document.getElementById('scanStatus');
       const outEl = document.getElementById('scanResult');
+      const submitBtn = document.getElementById('scanSubmitBtn');
       const fd = new FormData(form);
       const payload = Object.fromEntries(fd.entries());
-      statusEl.textContent = 'Scanning…';
+      statusEl.textContent = '⏳ Scanning in progress...';
       outEl.textContent = '';
+      if (submitBtn) { submitBtn.disabled = true; submitBtn.textContent = 'Scanning...'; }
       try {
         const r = await fetch('/start_scan', {
           method: 'POST',
@@ -11941,13 +11978,15 @@ def dashboard():
           outEl.textContent = JSON.stringify(j, null, 2);
           return;
         }
-        statusEl.textContent = 'Scan complete';
+        statusEl.textContent = '✅ Scan complete';
         outEl.textContent = `Risk: ${j.harm_level || 'n/a'}
 Model: ${j.model_used || 'n/a'}
 ${j.result || ''}`;
       } catch (e) {
         statusEl.textContent = 'Scan failed';
         outEl.textContent = String(e);
+      } finally {
+        if (submitBtn) { submitBtn.disabled = false; submitBtn.textContent = 'Run Scan'; }
       }
     }
     async function fillGps(){
