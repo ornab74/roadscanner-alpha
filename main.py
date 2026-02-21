@@ -2479,6 +2479,17 @@ def get_session_signing_keys(app) -> list[bytes]:
         keys.append(_hmac_derive(base_b, b"flask-session-signing-v1", window=(w - i), out_len=32))
     return keys
 
+        max_age = int(app.permanent_session_lifetime.total_seconds())
+        for key in get_session_signing_keys(app):
+            ser = self._make_serializer(key)
+            if not ser:
+                continue
+            try:
+                data = ser.loads(s, max_age=max_age)
+                return self.session_class(data)
+            except (BadTimeSignature, BadSignature, Exception):
+                continue
+        return self.session_class()
 
 def get_csrf_signing_key(app) -> bytes:
     base = getattr(app, "secret_key", None) or app.config.get("SECRET_KEY")
