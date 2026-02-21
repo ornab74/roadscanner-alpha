@@ -2479,18 +2479,6 @@ def get_session_signing_keys(app) -> list[bytes]:
         keys.append(_hmac_derive(base_b, b"flask-session-signing-v1", window=(w - i), out_len=32))
     return keys
 
-        max_age = int(app.permanent_session_lifetime.total_seconds())
-        for key in get_session_signing_keys(app):
-            ser = self._make_serializer(key)
-            if not ser:
-                continue
-            try:
-                data = ser.loads(s, max_age=max_age)
-                return self.session_class(data)
-            except (BadTimeSignature, BadSignature, Exception):
-                continue
-        return self.session_class()
-
 def get_csrf_signing_key(app) -> bytes:
     base = getattr(app, "secret_key", None) or app.config.get("SECRET_KEY")
     base_b = _require_secret_bytes(base, name="SECRET_KEY", env_hint="INVITE_CODE_SECRET_KEY")
@@ -2514,16 +2502,20 @@ class MultiKeySessionInterface(SecureCookieSessionInterface):
         if not cookie_value:
             return self.session_class()
 
+        # Keep max_age assignment inside this method body to prevent accidental
+        # dedent/indent merge regressions that can break module import.
         max_age = int(app.permanent_session_lifetime.total_seconds())
+
         for key in get_session_signing_keys(app):
             serializer = self._make_serializer(key)
-            if not serializer:
+            if serializer is None:
                 continue
             try:
                 data = serializer.loads(cookie_value, max_age=max_age)
                 return self.session_class(data)
             except (BadTimeSignature, BadSignature, Exception):
                 continue
+
         return self.session_class()
 
     def save_session(self, app, session, response):
