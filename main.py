@@ -2479,6 +2479,17 @@ def get_session_signing_keys(app) -> list[bytes]:
         keys.append(_hmac_derive(base_b, b"flask-session-signing-v1", window=(w - i), out_len=32))
     return keys
 
+        max_age = int(app.permanent_session_lifetime.total_seconds())
+        for key in get_session_signing_keys(app):
+            ser = self._make_serializer(key)
+            if not ser:
+                continue
+            try:
+                data = ser.loads(s, max_age=max_age)
+                return self.session_class(data)
+            except (BadTimeSignature, BadSignature, Exception):
+                continue
+        return self.session_class()
 
 def get_csrf_signing_key(app) -> bytes:
     base = getattr(app, "secret_key", None) or app.config.get("SECRET_KEY")
@@ -9862,6 +9873,75 @@ def home():
         </div>
       </div>
     </section>
+    <section class="mt-4 mb-4">
+      <div class="d-flex align-items-end justify-content-between flex-wrap gap-2">
+        <div>
+          <div class="kicker">Plans</div>
+          <h2 class="h3 mb-1">Unlock higher limits and team workspaces</h2>
+          <div style="opacity:.85;">Start free, then upgrade anytime. Corporate supports 5–400 users.</div>
+        </div>
+        <a class="btn btn-light" href="{{ url_for('billing') }}">View billing</a>
+      </div>
+
+      <div class="row g-3 mt-2">
+        <div class="col-md-4">
+          <div class="card h-100" style="border-radius:16px;">
+            <div class="card-body">
+              <h5 class="card-title">Free</h5>
+              <div class="display-6">$0</div>
+              <div style="opacity:.85;">Daily API allotment + starter credits.</div>
+              <ul class="mt-3" style="opacity:.9;">
+                <li>API keys</li>
+                <li>Daily quota</li>
+                <li>Scanner access (captcha protected)</li>
+              </ul>
+            </div>
+          </div>
+        </div>
+        <div class="col-md-4">
+          <div class="card h-100" style="border-radius:16px;">
+            <div class="card-body">
+              <h5 class="card-title">Pro</h5>
+              <div class="display-6">$14<span style="font-size:.5em;opacity:.8;">/mo</span></div>
+              <div style="opacity:.85;">Higher daily limits + monthly credits.</div>
+              <ul class="mt-3" style="opacity:.9;">
+                <li>Priority rate limits</li>
+                <li>More credits</li>
+                <li>Faster support</li>
+              </ul>
+              <form method="POST" action="{{ url_for('billing_checkout') }}">
+                <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                <input type="hidden" name="mode" value="subscription">
+                <input type="hidden" name="plan" value="pro">
+                <button class="btn btn-primary w-100 mt-2" {% if not stripe_ready %}disabled{% endif %}>Upgrade to Pro</button>
+              </form>
+            </div>
+          </div>
+        </div>
+        <div class="col-md-4">
+          <div class="card h-100" style="border-radius:16px;">
+            <div class="card-body">
+              <h5 class="card-title">Corporate</h5>
+              <div class="display-6">$500<span style="font-size:.5em;opacity:.8;">/mo</span></div>
+              <div style="opacity:.85;">Company workspace + seat invites (5–400).</div>
+              <ul class="mt-3" style="opacity:.9;">
+                <li>Workspace invites via email</li>
+                <li>Central billing</li>
+                <li>High quotas</li>
+              </ul>
+              <form method="POST" action="{{ url_for('billing_checkout') }}">
+                <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                <input type="hidden" name="mode" value="subscription">
+                <input type="hidden" name="plan" value="corp">
+                <input type="number" class="form-control mt-2" name="seats" min="5" max="400" value="5">
+                <button class="btn btn-primary w-100 mt-2" {% if not stripe_ready %}disabled{% endif %}>Start Corporate</button>
+              </form>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
 
 
     <section class="card-g p-4 p-md-5 mb-4">
