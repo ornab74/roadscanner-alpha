@@ -2622,6 +2622,16 @@ def set_feature_flag(db: sqlite3.Connection, key: str, value: str) -> None:
     )
     db.commit()
 
+
+def is_maintenance_mode() -> bool:
+    """Read maintenance mode from config, with env fallback for safe boot."""
+    try:
+        with db_connect(DB_FILE) as db:
+            val = get_feature_flag(db, "MAINTENANCE_MODE", os.getenv("MAINTENANCE_MODE", "false"))
+            return str(val).strip().lower() in ("1", "true", "yes", "on")
+    except Exception:
+        return str(os.getenv("MAINTENANCE_MODE", "false")).strip().lower() in ("1", "true", "yes", "on")
+
 EXPIRATION_HOURS = 65
 
 app.config.update(SESSION_COOKIE_SECURE=True,
@@ -4551,6 +4561,33 @@ def _user_is_banned(username: str) -> tuple[bool, str]:
     """Returns (is_banned, reason)."""
     if not username:
         return False, ""
+    try:
+        with db_connect(DB_FILE) as db:
+            cur = db.cursor()
+            cur.execute(
+                "SELECT COALESCE(is_banned,0), banned_until, COALESCE(banned_reason,'') FROM users WHERE username = ?",
+                (username,),
+            )
+            row = cur.fetchone()
+            if not row:
+                return False, ""
+
+            is_banned, banned_until, reason = int(row[0] or 0), row[1], row[2] or ""
+            if is_banned:
+                if banned_until is not None and int(banned_until) > 0 and _now_ts() >= int(banned_until):
+                    # Auto-unban expired bans.
+                    cur.execute(
+                        "UPDATE users SET is_banned = 0, banned_until = NULL, banned_reason = NULL WHERE username = ?",
+                        (username,),
+                    )
+                    db.commit()
+                    return False, ""
+                return True, reason
+            return False, ""
+    except Exception:
+        logger.exception("Failed to read ban state")
+        return False, ""
+
 
 def _user_throttle_until(username: str) -> int:
     """Returns epoch seconds until throttle expires; 0 means not throttled."""
@@ -4570,6 +4607,7 @@ def _user_throttle_until(username: str) -> int:
     except Exception:
         logger.exception("Failed to read throttle state")
         return 0
+
 
 def _maybe_flag_anomaly(username: str) -> None:
     """Lightweight abuse detection. Flags spikes and applies temporary throttles."""
@@ -4615,26 +4653,7 @@ def _maybe_flag_anomaly(username: str) -> None:
             db.commit()
     except Exception:
         logger.exception("Failed anomaly check")
-    try:
-        with db_connect(DB_FILE) as db:
-            cur = db.cursor()
-            cur.execute("SELECT COALESCE(is_banned,0), banned_until, COALESCE(banned_reason,'') FROM users WHERE username = ?", (username,))
-            row = cur.fetchone()
-            if not row:
-                return False, ""
-            is_banned, banned_until, reason = int(row[0] or 0), row[1], row[2] or ""
-            if is_banned:
-                if banned_until is not None and int(banned_until) > 0:
-                    if _now_ts() >= int(banned_until):
-                        # auto-unban
-                        cur.execute("UPDATE users SET is_banned = 0, banned_until = NULL, banned_reason = NULL WHERE username = ?", (username,))
-                        db.commit()
-                        return False, ""
-                return True, reason
-            return False, ""
-    except Exception:
-        logger.exception("Failed to read ban state")
-        return False, ""
+
 
 def record_user_query(username: str, kind: str) -> None:
     if not username:
@@ -5012,7 +5031,7 @@ def blog_delete(post_id: int) -> bool:
         logger.error(f"blog_delete failed: {e}", exc_info=True)
         return False
 
-@app.get("/blog")
+@app.get("/blog", endpoint="blog")
 def blog_index():
     posts = blog_list_published(limit=50, offset=0)
     seed = colorsync.sample()
